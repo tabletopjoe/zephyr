@@ -1,0 +1,1838 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>zephyr</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0e0c1a; overflow: hidden; }
+    body { display: flex; align-items: center; justify-content: center; }
+    /* The canvas is only 640×360 real pixels; CSS scales it up to fill the window,
+       and `pixelated` keeps every pixel a crisp square instead of
+       the browser's default blur. */
+    canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <script>
+    // =====================================================================
+    // 1. A tiny canvas, drawn by writing pixels straight into a buffer.
+    // =====================================================================
+    // S is the pixel density relative to scenes 1–2 (320×180): at 2 there
+    // are twice as many pixels each way, so detail is finer. The scene was
+    // laid out at 320×180, so positions and sizes below are written as
+    // "320-scale number × S" — change S and everything rescales together.
+    const S = 3;
+    const W = 320 * S, H = 180 * S; // the scene's true resolution
+    const HORIZON = 100 * S;        // sky above this row, sea below
+
+    const canvas = document.getElementById("c");
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext("2d");
+    const image = ctx.createImageData(W, H);
+    // One 32-bit number per pixel — far faster than thousands of fillRect calls.
+    const buf = new Uint32Array(image.data.buffer);
+
+    // "#rrggbb" → the 32-bit pixel format ImageData uses (bytes are A,B,G,R).
+    function rgb(hex) {
+      const n = parseInt(hex.slice(1), 16);
+      return (0xff000000 | ((n & 0xff) << 16) | (n & 0xff00) | ((n >> 16) & 0xff)) >>> 0;
+    }
+    function px(x, y, color) {
+      x |= 0; y |= 0;
+      if (x >= 0 && x < W && y >= 0 && y < H) buf[y * W + x] = color;
+    }
+
+    // Fill the whole window, no black margins: scale the canvas until it
+    // covers the window in both directions (keeping pixels square), and
+    // let the centered overflow trim a sliver off two edges when the
+    // window isn't exactly 16:9. `view` records which part of the canvas is
+    // actually visible, so overlays (speed bar, chart) never get trimmed.
+    const view = { left: 0, top: 0, right: W, bottom: H };
+    function fit() {
+      const s = Math.max(innerWidth / W, innerHeight / H);
+      canvas.style.width = W * s + "px";
+      canvas.style.height = H * s + "px";
+      const cutX = Math.max(0, Math.ceil((W - innerWidth / s) / 2));
+      const cutY = Math.max(0, Math.ceil((H - innerHeight / s) / 2));
+      Object.assign(view, { left: cutX, top: cutY, right: W - cutX, bottom: H - cutY });
+    }
+    addEventListener("resize", fit);
+    fit();
+
+    // =====================================================================
+    // 2. Helpers: dithering, deterministic noise, seeded randomness.
+    // =====================================================================
+    // A 4×4 Bayer matrix: per-pixel thresholds that turn a smooth blend
+    // between two colors into a checkerboard-ish pattern — the classic
+    // pixel-art way to fake gradients with few colors.
+    const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16);
+    const bayer = (x, y) => BAYER[(y & 3) * 4 + (x & 3)];
+
+    // Same inputs → same "random" number in [0, 1), for sparkle and texture.
+    function hash(a, b) {
+      let h = (Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263)) | 0;
+      h = Math.imul(h ^ (h >>> 13), 1274126177);
+      return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+    }
+    // Seeded random sequence, so the stars land in the same place every load.
+    function seeded(seed) {
+      return () => {
+        seed = (seed + 0x6d2b79f5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    // =====================================================================
+    // 3. Sky: a dusk gradient, dithered between 8 colors, with stars.
+    // =====================================================================
+    // The sky toward the sunset (west), and the opposite way (east), where
+    // it gets about 70% less sunlight: deep indigo fading to a dim mauve
+    // glow at the horizon. Facing anywhere between, the sky blends between
+    // the two (see skyToward).
+    const SKY_WEST = ["#1b1838", "#2b2453", "#4a2f6b", "#7a3b73", "#b2486e", "#e0625f", "#f59a5c", "#ffc27a"].map(rgb);
+    const SKY_EAST = ["#0b0a1c", "#100e27", "#171433", "#201a3e", "#2b2046", "#38264d", "#452c53", "#533459"].map(rgb);
+    // Color a, moved k (0 … 1) of the way to color b.
+    function mixColor(a, b, k) {
+      const ch = (s) => Math.round(((a >>> s) & 255) * (1 - k) + ((b >>> s) & 255) * k) << s;
+      return (0xff000000 | ch(16) | ch(8) | ch(0)) >>> 0;
+    }
+    // The sky's colors with the view `away` (0 … 1) of the way round from
+    // facing the sun to facing directly away from it.
+    const skyToward = (away) => SKY_WEST.map((c, i) => mixColor(c, SKY_EAST[i], away));
+    function drawSky(colors) {
+      for (let y = 0; y < HORIZON; y++) {
+        const v = Math.pow(y / (HORIZON - 1), 1.15) * (colors.length - 1);
+        const i = Math.floor(v), f = v - i;
+        for (let x = 0; x < W; x++) {
+          px(x, y, i + 1 < colors.length && f > bayer(x, y) ? colors[i + 1] : colors[i]);
+        }
+      }
+    }
+
+    const STAR_BRIGHT = rgb("#fff6d8"), STAR_DIM = rgb("#9d93c4");
+    const stars = (() => {
+      const rand = seeded(7);
+      return Array.from({ length: 90 }, () => ({    // more, smaller stars at the finer resolution
+        x: Math.floor(rand() * W),
+        y: Math.floor(Math.pow(rand(), 1.6) * 42 * S), // denser near the top, where it's darkest
+        bright: rand() < 0.3,                      // a few stars are bright by default
+        phase: rand() * Math.PI * 2,
+        speed: 0.3 + rand() * 0.7,                 // each on its own slow rhythm
+      }));
+    })();
+    // A gentle twinkle: each star rides its own slow sine wave and only
+    // changes at the extremes — dim stars flare bright briefly at the top
+    // of the wave and blink out briefly at the bottom; bright stars just
+    // dip to dim now and then.
+    function drawStars(t) {
+      for (const s of stars) {
+        const b = Math.sin(t * s.speed + s.phase);
+        if (s.bright) px(s.x, s.y, b < -0.6 ? STAR_DIM : STAR_BRIGHT);
+        else if (b > 0.85) px(s.x, s.y, STAR_BRIGHT);
+        else if (b > -0.95) px(s.x, s.y, STAR_DIM);
+      }
+    }
+
+    // The sun: big (it's a fantastical scene), half-sunk behind the horizon,
+    // with a wide dithered halo. The sun sets due west; the boat starts out
+    // heading a little south of that, so the sun starts at SUN_X, right of
+    // straight ahead (AHEAD_X, the middle of the screen, where the waves
+    // spread out from). Turning swings it across the sky and, turned far
+    // enough, out of view behind you (`sunX`, see section 10).
+    const AHEAD_X = W / 2;
+    const SUN_X = 238 * S, SUN_Y = HORIZON + 3 * S, SUN_R = 26 * S, SUN_HALO_R = 11 * S;
+    // The disc is one color, except for a thin outer edge that blends
+    // (dithered, like the sky) into a darker gold.
+    const SUN_FACE = rgb("#fff1b5"), SUN_RIM = rgb("#ffd27a");
+    const SUN_EDGE = 0.05; // the edge blend's width, as a fraction of the radius — the other 95% is SUN_FACE
+    const HALO_NEAR = rgb("#ff9a52"), HALO_FAR = rgb("#ffb36b"); // warm close in, peachier further out
+
+    // The sun is drawn once, into a list of pixels relative to its center,
+    // then stamped wherever it is each frame — cheaper than recomputing,
+    // and the dithering travels with the sun instead of shimmering as
+    // steering moves it.
+    const sunPixels = [];
+    for (let dy = -SUN_R - SUN_HALO_R; dy < HORIZON - SUN_Y; dy++) {
+      for (let dx = -SUN_R - SUN_HALO_R; dx <= SUN_R + SUN_HALO_R; dx++) {
+        const d = Math.hypot(dx, dy);
+        const ditherX = dx + 1024, ditherY = dy + 1024; // keep bayer()'s inputs positive
+        if (d < SUN_R) {
+          // 0 inside the edge band, rising to 1 at the rim; dithered between the two colors.
+          const edge = Math.max(0, (d / SUN_R - (1 - SUN_EDGE)) / SUN_EDGE);
+          sunPixels.push(dx, dy, edge > bayer(ditherX, ditherY) ? SUN_RIM : SUN_FACE);
+        } else if (d < SUN_R + SUN_HALO_R) {
+          // Halo: thins out with distance, warmer orange near the disc.
+          const h = (d - SUN_R) / SUN_HALO_R; // 0 at the rim → 1 at the outer edge
+          if (bayer(ditherX, ditherY) < 0.5 * (1 - h)) sunPixels.push(dx, dy, h < 0.4 ? HALO_NEAR : HALO_FAR);
+        }
+      }
+    }
+    let sunX = SUN_X;
+    function drawSun() {
+      const sx = Math.round(sunX); // whole pixels, so the disc stays crisp as it moves
+      for (let i = 0; i < sunPixels.length; i += 3) px(sx + sunPixels[i], SUN_Y + sunPixels[i + 1], sunPixels[i + 2]);
+    }
+
+    // The moon: a big crescent hanging above the horizon to the southeast
+    // (half past four, if north were twelve o'clock), on the darker side of
+    // the sky. It's lit from the sun, which is behind you and below the
+    // horizon when you face it, so the lit sliver is on its lower right.
+    // Like the sun it stays at its bearing and swings across as you turn
+    // (`moonX`, see section 10); clouds pass in front of it. Drawn once
+    // into a pixel list, the same way as the sun.
+    const MOON_R = 22 * S, MOON_Y = HORIZON - 46 * S, MOON_HALO_R = 8 * S;
+    const MOON_LIT = { x: 0.94, y: 0.34 };  // the way the sunlight comes from (lower right)
+    const MOON_THICK = 0.42;                // how far the shadow disc is shifted, as a fraction of the radius — more = fatter crescent
+    const MOON_FACE = rgb("#f6efd6"), MOON_RIM = rgb("#cfc3a4"), MOON_HALO = rgb("#3f3a6a");
+    const moonPixels = [];
+    for (let dy = -MOON_R - MOON_HALO_R; dy <= MOON_R + MOON_HALO_R; dy++) {
+      for (let dx = -MOON_R - MOON_HALO_R; dx <= MOON_R + MOON_HALO_R; dx++) {
+        const d = Math.hypot(dx, dy);
+        const ditherX = dx + 1024, ditherY = dy + 1024;
+        // The shadow: the same disc, shifted away from the light.
+        const shade = Math.hypot(dx + MOON_LIT.x * MOON_THICK * MOON_R, dy + MOON_LIT.y * MOON_THICK * MOON_R);
+        if (d < MOON_R && shade >= MOON_R) {
+          // Lit. The inner edge (the terminator) dithers into a duskier cream.
+          const edge = Math.max(0, 1 - (shade - MOON_R) / (0.12 * MOON_R));
+          moonPixels.push(dx, dy, edge > bayer(ditherX, ditherY) ? MOON_RIM : MOON_FACE);
+        } else if (d >= MOON_R && d < MOON_R + MOON_HALO_R) {
+          // A faint cool glow, strongest beside the lit side.
+          const lit = Math.max(0, (dx * MOON_LIT.x + dy * MOON_LIT.y) / d);
+          const h = (d - MOON_R) / MOON_HALO_R;
+          if (bayer(ditherX, ditherY) < 0.45 * lit * (1 - h)) moonPixels.push(dx, dy, MOON_HALO);
+        }
+      }
+    }
+    let moonX = -1e6;
+    function drawMoon() {
+      const mx = Math.round(moonX);
+      if (mx < -MOON_R * 2 || mx > W + MOON_R * 2) return;
+      for (let i = 0; i < moonPixels.length; i += 3) px(mx + moonPixels[i], MOON_Y + moonPixels[i + 1], moonPixels[i + 2]);
+    }
+
+    // =====================================================================
+    // 4. Clouds: low streaks near the horizon — each a stack of overlapping
+    //    horizontal strands with dithered, tapering ends, lit from below by
+    //    the sun and warmer the closer they are to it.
+    //
+    //    Each cloud has a place in the world, not a fixed spot on screen:
+    //    a distance, a height above the horizon and a sideways position.
+    //    Its screen position and size come from dividing by the distance —
+    //    the same perspective as the waves — so as the boat travels forward
+    //    a cloud grows, rises and spreads outward from straight ahead. The
+    //    wind pushes every cloud slowly rightward, even when you're stopped,
+    //    and turning swings them across the sky along with the sun.
+    //
+    //    Like the gulls, every cloud is "random but repeatable": when one
+    //    gets close enough to pass overhead it fades out, and a new one
+    //    forms far off near the horizon; one that leaves the screen is
+    //    replaced the same way (or, when you're going slowly enough for the
+    //    wind to win, by a fresh one blowing in from the left).
+    // =====================================================================
+    // Three tones per strand — dusky top, rose middle, lit bottom rim. Rims
+    // near the sun take the sky's deep oranges, never the sun's own yellow.
+    // Bodies darker than the sky around them so they read against the glow.
+    // Facing away from the sun they dim along with the sky (shadeClouds):
+    // dusky bodies, and only a faint glow left on the rims.
+    const CLOUDS_WEST = ["#4f2a5a", "#7e3a68", "#b24a63", "#f4876a", "#ff8a4c"].map(rgb);
+    const CLOUDS_EAST = ["#1c1630", "#261c3c", "#352346", "#5e3a5c", "#5e3a5c"].map(rgb);
+    let CLOUD_TOP, CLOUD_MID, CLOUD_ROSE, CLOUD_RIM_FAR, CLOUD_RIM_NEAR;
+    function shadeClouds(away) {
+      [CLOUD_TOP, CLOUD_MID, CLOUD_ROSE, CLOUD_RIM_FAR, CLOUD_RIM_NEAR] = CLOUDS_WEST.map((c, i) => mixColor(c, CLOUDS_EAST[i], away));
+    }
+
+    const CLOUD_COUNT = 6;
+    const D_FAR = 2, D_NEAR = 0.7; // clouds form at D_FAR (small, low) and fade out at D_NEAR (big, high)
+    const D_REF = 1.3;             // the distance at which a cloud is its "listed" size
+    const CLOUD_FADE = 0.15;       // distance over which a cloud dithers in as it forms, and out as it passes
+    const APPROACH = 0.0087;       // distance closed per second at 1× — about 150 s from forming to gone
+    const WIND = 3 * S;            // the wind's push, in screen pixels per second at D_REF
+    const BODY = 1.15;             // strand count multiplier: 15% more body than the original wisps
+    const TAPER = 0.26;            // fraction of each strand that tapers off at either end
+
+    const clouds = [];
+    let cloudsMade = 0; // every new cloud gets the next seed, so no two are alike
+    // mode: "start" (scattered anywhere when the scene opens), "far" (forms
+    // near the horizon), "left" / "right" (blows in from that edge).
+    function spawnCloud(slot, mode) {
+      const id = cloudsMade++;
+      const rand = seeded(1000 + id * 7919);
+      const anyDist = D_NEAR + CLOUD_FADE + rand() * (D_FAR - D_NEAR - 2 * CLOUD_FADE);
+      const dist = mode === "far" ? D_FAR : anyDist;
+      const lift = (10 + rand() * 28) * S * D_REF; // height above the horizon
+      const len = (45 + rand() * 65) * S * D_REF;  // overall length
+      const w = len / dist;                         // its on-screen length right now
+      let screenX = rand() * W;
+      if (mode === "left") screenX = -w / 2 - 2 * S;
+      if (mode === "right") screenX = W + w / 2 + 2 * S;
+      clouds[slot] = {
+        seed: 500 + id * 31, dist, lift, len,
+        xw: (screenX - AHEAD_X) * dist, // sideways position from straight ahead, in world terms
+        fadeIn: mode === "far",         // only clouds forming in the distance dither in
+      };
+    }
+    for (let i = 0; i < CLOUD_COUNT; i++) spawnCloud(i, "start");
+
+    // Where a cloud is on screen. Its sideways position is measured from
+    // straight ahead, so as it comes closer it spreads out from the middle
+    // of the screen — whichever way the boat is heading.
+    function cloudOnScreen(c) {
+      return {
+        cx: AHEAD_X + c.xw / c.dist,
+        cy: HORIZON - c.lift / c.dist,
+        w: c.len / c.dist,
+        k: D_REF / c.dist, // how much bigger than its listed size it is now
+      };
+    }
+
+    // Below this speed the wind outpaces perspective at the screen's edges,
+    // so a cloud blown off the right can re-enter on the left. Faster than
+    // that, travel pushes edge clouds outward harder than the wind pushes
+    // them in — a cloud entering at an edge would be swept straight back
+    // out — so clouds that leave re-form far off instead, as they would
+    // when sailing toward them.
+    const WIND_WINS_BELOW = 1.5;
+
+    // `windSide` is how much of the wind blows across the view: 1 straight
+    // to the right, -1 straight to the left, 0 head-on or from behind. The
+    // wind has a fixed direction on the map (section 9), so which way the
+    // clouds drift depends on which way you're facing.
+    // `swing` is how many pixels turning slides the view this frame
+    // (positive = rightward): every cloud shifts by exactly that much, like
+    // the sun.
+    function updateClouds(dt, speed, swing, windSide) {
+      const slow = speed < WIND_WINS_BELOW && Math.abs(windSide) > 0.3;
+      clouds.forEach((c, slot) => {
+        c.dist -= dt * speed * APPROACH;
+        c.xw += dt * WIND * windSide * D_REF; // a steady world-space push reads faster for nearer clouds
+        c.xw += swing * c.dist;               // the turn, as a pixel shift at the cloud's current distance
+        if (c.dist <= D_NEAR) return spawnCloud(slot, "far");
+        const { cx, w } = cloudOnScreen(c);
+        const offRight = cx - w / 2 > W + 4 * S, offLeft = cx + w / 2 < -4 * S;
+        if (offRight && slow && windSide > 0) spawnCloud(slot, "left");
+        else if (offLeft && slow && windSide < 0) spawnCloud(slot, "right");
+        else if (offRight || offLeft) spawnCloud(slot, "far");
+      });
+    }
+
+    function drawCloud(c) {
+      const { cx, cy, w, k } = cloudOnScreen(c);
+      // Fully drawn except while forming far off or passing overhead, when
+      // it dithers in or out.
+      const fade = Math.min(1, (c.dist - D_NEAR) / CLOUD_FADE, c.fadeIn ? (D_FAR - c.dist) / CLOUD_FADE : 1);
+      const sunCol = Math.round(sunX);
+      const rand = seeded(c.seed);
+      // Strands stay 2–4 pixels thick whatever the cloud's size, so they're
+      // fine at this resolution; there are S × BODY times as many as the
+      // original wisps.
+      const strands = Math.round((8 + Math.floor(rand() * 4)) * S * BODY);
+      for (let s = 0; s < strands; s++) {
+        const len = Math.round(w * (0.35 + rand() * 0.65));
+        const sx = Math.round(cx - w / 2 + rand() * (w - len));
+        const sy = Math.round(cy + (rand() - 0.5) * 14 * S * k);
+        const thick = 2 + Math.floor(rand() * rand() * 3); // mostly 2–3 px, now and then 4
+        const upper = sy < cy - 2 * S * k;
+        for (let i = 0; i < len; i++) {
+          const x = sx + i;
+          // 1 in the middle of the strand, falling to 0 at its ends.
+          const taper = Math.min(1, Math.min(i, len - 1 - i) / (len * TAPER)) * fade;
+          const rim = Math.abs(x - sunCol) < 70 * S ? CLOUD_RIM_NEAR : CLOUD_RIM_FAR;
+          for (let r = 0; r < thick; r++) {
+            const y = sy + r;
+            if (y >= HORIZON || bayer(x, y) >= taper) continue;
+            // Bottom row catches the light (rim on the lower strands, rose on
+            // the upper ones); the row above it is rose; the rest is dusk.
+            let col = upper ? CLOUD_TOP : CLOUD_MID;
+            if (r === thick - 1) col = upper ? CLOUD_ROSE : rim;
+            else if (r === thick - 2) col = upper ? CLOUD_MID : CLOUD_ROSE;
+            px(x, y, col);
+          }
+        }
+      }
+    }
+
+    // =====================================================================
+    // 5. Sea: the same Hokusai-style waves as scene 1 — slow rise up the
+    //    back, steep front face, foam lip curling over it — but instead of
+    //    drifting sideways, the camera travels toward the sun.
+    //
+    //    Every row has a depth that keeps growing: 0 is the horizon, 1 is
+    //    the bottom of the screen. Its position, wave size and colors are
+    //    all worked out from that depth each frame, so a row rises out of
+    //    the horizon small and hazy, swells and darkens as it comes closer,
+    //    and slides out the bottom — then starts over at the horizon as a
+    //    fresh row. Waves spread outward from a vanishing point straight
+    //    below the sun, the direction of travel.
+    //
+    //    Rows accelerate as they approach, the way the view from a moving
+    //    boat works: the distance barely changes, the water close by rushes
+    //    past. Each row's progress runs at a steady pace, but its depth is
+    //    that progress raised to EASE — so rows creep near the horizon
+    //    (and barely spread there) and speed up as they come close.
+    // =====================================================================
+    const ROWS = 16;
+    const MAX_DEPTH = 1.25;    // rows travel past 1 so their crests clear the bottom edge before restarting
+    const TRIP_SECONDS = 20;   // how long one row takes from the horizon to gone at 1× throttle
+    const EASE = 2;            // how sharply rows speed up as they approach (1 = no speed-up)
+    const HORIZON_LINE = rgb("#d98a7f");
+
+    // Blend two "#rrggbb" colors; t = 0 gives a, t = 1 gives b.
+    function mix(a, b, t) {
+      const pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16);
+      const ch = (s) => Math.round(((pa >> s) & 255) * (1 - t) + ((pb >> s) & 255) * t);
+      return rgb("#" + ((ch(16) << 16) | (ch(8) << 8) | ch(0)).toString(16).padStart(6, "0"));
+    }
+
+    // How a row looks at a given depth — the same formulas as scene 1's
+    // fixed rows, but now evaluated continuously as the row approaches.
+    function rowLook(depth) {
+      const k = Math.min(depth, 1); // colors stop darkening once off the bottom
+      return {
+        depth,
+        base: HORIZON + (3 + 81 * Math.pow(depth, 1.3)) * S, // trough line
+        height: (3.5 + 18.5 * Math.pow(depth, 1.4)) * S,     // typical crest height
+        scale: (7 + 45 * depth) * S,                         // pixels per unit of wave length
+        body: mix("#424a80", "#0d1a40", k),   // deep water
+        hollow: mix("#333a6c", "#07102a", k), // the shadowed tube under a curling lip
+        shade: mix("#3a4276", "#0a1535", k),  // between hollow and body: the face shadow's softer edge
+        line: mix("#5d67a0", "#25497e", k),   // carved contour lines
+        top: mix("#7f85b6", "#6a98cc", k),    // surface edge
+        foam: mix("#a4a6cc", "#e6eef6", k),   // crest foam
+      };
+    }
+
+    // A row's waves, in size-free units: each wave is about 1 unit long and
+    // its height is a fraction of the row's typical height. rowLook's scale
+    // and height turn these into pixels at whatever depth the row is at.
+    // The pattern repeats every `length` units.
+    //
+    // Each wave also gets its own personality for the details drawn on it,
+    // so no two crests or shadows are alike:
+    //   shadow      how deep the dark face shadow hangs, as a fraction of the wave's height
+    //   curlR       curl radius, as a fraction of the wave's height (tight → big and lazy)
+    //   curlStretch the curl's width vs. its height (squeezed → stretched oval)
+    //   curlSweep   how far the lip curls back under itself, past horizontal (radians)
+    //   lipExtra    extra lip thickness, in pixels
+    //   foamEnd     how far round the lip the white foam reaches (fraction of a half-turn)
+    //   claws       how many foam "claws" hang off the lip (0–4)
+    function buildPattern(seed) {
+      const rand = seeded(seed);
+      const waves = [];
+      let length = 0;
+      for (let n = 0; n < 60; n++) {
+        const w = 0.65 + rand() * 0.7;
+        waves.push({
+          u0: length, w, h: 0.4 + rand() * 0.8, peak: 0.18 + rand() * 0.08,
+          shadow: 0.5 + rand() * 0.5,
+          curlR: 0.35 + rand() * 0.23,
+          curlStretch: 0.8 + rand() * 0.5,
+          curlSweep: 0.45 + rand() * 0.8,
+          lipExtra: rand() < 0.4 ? 1 : 0,
+          foamEnd: 0.78 + rand() * 0.14,
+          claws: Math.floor(rand() * 5),
+          clawSeed: Math.floor(rand() * 1e6),
+        });
+        length += w;
+      }
+      return { waves, length, offset: rand() * length, seed };
+    }
+
+    // The wave covering pattern position u (already wrapped into the pattern).
+    function waveAt(waves, u) {
+      let lo = 0, hi = waves.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (waves[mid].u0 <= u) lo = mid;
+        else hi = mid - 1;
+      }
+      return waves[lo];
+    }
+
+    // Each of the ROWS slots gets a new pattern every time it restarts at
+    // the horizon, so the sea never visibly repeats.
+    const slotPatterns = [];
+    function patternFor(slot, lap) {
+      const cached = slotPatterns[slot];
+      if (cached && cached.lap === lap) return cached.pattern;
+      const pattern = buildPattern(100 + slot + lap * 37);
+      slotPatterns[slot] = { lap, pattern };
+      return pattern;
+    }
+
+    // `side` is how far this row's pattern has been shifted by turning, in
+    // its own wave-length units (see drawSea).
+    // `fillTo` is how far down this row's water needs painting: the next
+    // nearer row covers everything below its own trough line, so there's no
+    // point filling past it (a big saving at this resolution).
+    // Carved-line depths below the surface, as a lookup table (checked for
+    // every pixel, so a table beats searching a list).
+    const IS_CONTOUR = new Uint8Array(13 * S);
+    for (const d of [3, 7, 12]) IS_CONTOUR[d * S] = 1;
+    // The sun's glitter column is never wider than this, either side of the sun.
+    const GLITTER_REACH = SUN_R + (H - HORIZON) * 0.35 + 1;
+    // Per-column facts about every row, worked out for all rows before any
+    // painting (see shapeRow): row i's column x is at index i * W + x.
+    const colSurface = new Int32Array(ROWS * W);   // the surface's y
+    const colRise = new Float32Array(ROWS * W);    // how far up the wave this column is (0 trough … 1 crest)
+    const colShadow = new Float32Array(ROWS * W);  // how deep the face shadow hangs
+    const colTexture = new Int32Array(ROWS * W);   // texture key (see shapeRow)
+    const colPlain = new Int32Array(ROWS * W);     // depth below the surface past which it's plain water
+    const NOTHING_IN_FRONT = new Int32Array(W).fill(H); // "surface" in front of the nearest row: the bottom edge
+    const DETAIL_DEPTH = 13 * S;            // contour lines and highlights never go deeper than this
+    // The wave-shape curves, worked out once into tables (Math.pow and
+    // Math.sin are slow to call for every column of every row): for t
+    // from 0 to 1, the face's rise, the back's fall, how the face shadow
+    // deepens toward the crest, and how it tapers off past it.
+    const CURVE_STEPS = 4096;
+    const makeCurve = (f) => Float32Array.from({ length: CURVE_STEPS + 1 }, (_, i) => f(i / CURVE_STEPS));
+    const FACE_CURVE = makeCurve((t) => Math.pow(t, 0.45));
+    const BACK_CURVE = makeCurve((t) => Math.pow(t, 2.2));
+    const SHADOW_CURVE = makeCurve((t) => Math.pow(Math.sin(t * Math.PI / 2), 1.6));
+    const TAPER_CURVE = makeCurve((t) => Math.pow(t, 1.5));
+    const curve = (table, t) => table[Math.round(Math.min(1, Math.max(0, t)) * CURVE_STEPS)];
+    // The shape of a row's water surface, column by column, stored at
+    // index `at` onward in the col… arrays. Moving right, u only grows (until it
+    // wraps), so the wave under a column is usually the same one as for
+    // the column before — only search for it when it isn't.
+    function shapeRow(pattern, R, side, at) {
+      const { waves, length, offset } = pattern;
+      const wrap = (u) => ((u % length) + length) % length;
+      const curls = R.height >= 6 * S; // only rows tall enough to curl get shaded faces
+      let wave = null;
+      // u steps along by the same amount for every column, so add it on
+      // rather than working it out from scratch each time.
+      const du = 1 / R.scale;
+      let u = wrap(-AHEAD_X * du + offset + side) - du;
+      for (let x = 0; x < W; x++) {
+        u += du;
+        if (u >= length) u -= length;
+        if (!wave || u < wave.u0 || u >= wave.u0 + wave.w) wave = waveAt(waves, u);
+        const p = Math.min(1, Math.max(0, (u - wave.u0) / wave.w));
+        // Front face on the left shoots up almost vertically; the back on
+        // the right falls away fast, then trails off in a long scooped tail.
+        const rise = p < wave.peak ? curve(FACE_CURVE, p / wave.peak) : curve(BACK_CURVE, 1 - (p - wave.peak) / (1 - wave.peak));
+        const waveH = R.height * wave.h;
+        const sy = Math.round(R.base - waveH * rise);
+        // The face shadow under a breaking crest. Rather than filling the
+        // whole face down to a flat line (which left a rectangle's corner),
+        // it hangs from the surface by a depth that's greatest right under
+        // the curl, thins to nothing at the foot of the face, and wraps a
+        // little way past the crest before tapering off — so its outline
+        // follows the wave. Only for waves big enough to curl.
+        let shadowDepth = 0;
+        if (curls && waveH >= 5 * S) {
+          const deepest = waveH * wave.shadow;
+          if (p < wave.peak) {
+            shadowDepth = deepest * curve(SHADOW_CURVE, p / wave.peak);
+          } else {
+            const past = (p - wave.peak) * wave.w * R.scale; // pixels past the crest
+            const taper = waveH * 0.35;
+            if (past < taper) shadowDepth = deepest * curve(TAPER_CURVE, 1 - past / taper);
+          }
+        }
+        colSurface[at + x] = sy;
+        colRise[at + x] = rise;
+        colShadow[at + x] = shadowDepth;
+        // Texture key: a position along the pattern, so contour breaks and
+        // glints belong to the wave and travel with it.
+        colTexture[at + x] = Math.floor(u * 12 * S);
+        colPlain[at + x] = Math.max(DETAIL_DEPTH, Math.ceil(shadowDepth));
+      }
+    }
+
+    // Paints a row shaped by shapeRow (at index `at`): the water body, with
+    // contour lines following the surface, then the crests. `front` holds
+    // the surface of the row in front of this one (which will be painted
+    // over it next), so each column stops there instead of filling water
+    // that's about to be covered — nearly every pixel is painted just once.
+    // No clipping at the horizon: far tips rise above it as silhouettes.
+    function drawRow(pattern, R, side, at, front, frontAt, fillTo) {
+      const { waves, length, offset, seed } = pattern;
+      const sunCol = Math.round(sunX);
+      const body = R.body;
+      for (let x = 0; x < W; x++) {
+        const sy = colSurface[at + x];
+        const yEnd = Math.min(fillTo, front[frontAt + x]);
+        const plain = colPlain[at + x], shadow = colShadow[at + x];
+        // Near the surface, where the detail is, check each pixel…
+        const detailEnd = Math.min(yEnd, sy + plain);
+        let y = Math.max(sy, 0);
+        for (; y < detailEnd; y++) {
+          const d = y - sy; // depth below this column's surface
+          const i = y * W + x;
+          // Most pixels are plain water: past the thin surface band, outside
+          // the face shadow and not on a contour line. Skip the rest for them.
+          if (d > S && d >= shadow && (d >= plain || !IS_CONTOUR[d])) { buf[i] = body; continue; }
+          const rise = colRise[at + x], shadowDepth = shadow, s = colTexture[at + x];
+          let c = body;
+          // Sun glitter: within the sun's column, light lands on the wave
+          // tops, highlight bands and carved lines (never the shadowed faces).
+          const glint = Math.abs(x - sunCol) < GLITTER_REACH ? glitterAt(x, y) : 0;
+          const n = glint > 0 ? hash(s * 7 + seed, d) : 1;
+          if (d === 0 && n < 0.85 * glint) c = n < 0.35 * glint ? GLITTER_HI : GLITTER_LO;
+          else if (d === 0) c = rise > 0.9 ? R.foam : R.top;
+          // The face shadow (see shadowDepth above): darkest just under the
+          // surface, easing through a middle tone, then dithering out into
+          // the water — a soft edge rather than a hard outline.
+          else if (d < shadowDepth) {
+            const f = d / shadowDepth;
+            if (d <= S) c = body; // a thin lit rim just under the surface edge
+            else if (f < 0.55) c = R.hollow;
+            else if (f < 0.8) c = R.shade;
+            else c = bayer(x, y) < (f - 0.8) / 0.2 ? body : R.shade;
+          }
+          // A highlight band just under the rounded top of each wave's back.
+          else if (d <= S && rise > 0.55) c = n < 0.55 * glint ? GLITTER_LO : R.top;
+          // Carved contour lines, only on the wave backs, broken up like woodblock grooves.
+          else if (IS_CONTOUR[d] && rise > 0.12 && rise < 0.92 && hash((s >> 1) + seed, d) > 0.3) {
+            c = n < 0.4 * glint ? GLITTER_LO : R.line;
+          }
+          buf[i] = c; // x and y are always on screen here, so skip px()'s bounds check
+        }
+        // …and below it, it's plain water all the way down.
+        for (let i = y * W + x; y < yEnd; y++, i += W) buf[i] = body;
+      }
+      // Crests: every repeat of each wave's crest that lands on screen.
+      const margin = 30 * S;
+      const uLeft = (-margin - AHEAD_X) / R.scale + offset + side, uRight = (W + margin - AHEAD_X) / R.scale + offset + side;
+      waves.forEach((wave, i) => {
+        const cu = wave.u0 + wave.peak * wave.w;
+        for (let k = Math.ceil((uLeft - cu) / length); cu + k * length <= uRight; k++) {
+          const x = Math.round(AHEAD_X + (cu + k * length - offset - side) * R.scale);
+          const h = R.height * wave.h;
+          const cr = { x, y: Math.round(R.base - h), h, id: seed * 100 + i };
+          if (h >= 5 * S) drawCurl(R, cr, wave);
+          else if (h >= 2 * S) {
+            // Small waves: a little whitecap leaning forward (left) — a short
+            // dash on the crest with a shorter one tucked below its front.
+            for (let j = 0; j <= S; j++) px(x - j, cr.y, R.foam);
+            for (let j = S; j <= 2 * S; j++) px(x - j, cr.y + 1, R.foam);
+          }
+        }
+      });
+    }
+
+    // A breaking crest: the lip arcs forward (left) from the crest, curls
+    // down, then hooks back under itself — a "C" opening toward the wave.
+    // Inside the hook is the dark hollow of the tube; off the lip hang a
+    // few foam "claws". Every wave's curl is its own: radius, oval shape,
+    // how far it curls back, lip thickness, foam and claws all come from
+    // the wave's traits (see buildPattern).
+    function drawCurl(R, cr, wave) {
+      const r = Math.max(3 * S, Math.round(cr.h * wave.curlR)); // curl height radius
+      const stretch = wave.curlStretch;                          // width ÷ height of the oval
+      const cx = cr.x, cy = cr.y + r;                            // oval center below the crest
+      const top = cy - r;
+      // Hollow first, so the lip draws over its edge. It fills the inside of
+      // the curl's oval, but its right side slants back down and to the left
+      // (the back wall of the tube) instead of dropping straight down from
+      // the crest — no vertical edge.
+      // Each screen row of the hollow is one unbroken run of pixels, so work
+      // out where it starts and ends and fill straight across.
+      const inner = r - 1.2 * S;
+      for (let y = Math.max(top + 2 * S, 0); y <= cy + r && y < H; y++) {
+        const ey = y - cy, room = inner * inner - ey * ey;
+        if (room <= 0) continue;
+        const half = Math.sqrt(room) * stretch;                     // the oval's half-width on this row
+        const rightEdge = cx - (y - top) * 0.35;
+        const x0 = Math.max(0, Math.floor(cx - half) + 1);
+        const x1 = Math.min(W - 1, Math.ceil(cx + half) - 1, Math.floor(rightEdge));
+        if (x1 >= x0) buf.fill(R.hollow, y * W + x0, y * W + x1 + 1);
+      }
+      // The lip: from the top of the oval (-90°) round past the far left
+      // (-180°), curling back underneath by this wave's sweep. A foam outer
+      // edge over a lighter-water inner band.
+      const end = -Math.PI - wave.curlSweep;
+      const foamUntil = -Math.PI * wave.foamEnd;
+      const thick = S + wave.lipExtra;
+      // Angle steps about 0.7 pixels apart along the outside of the arc —
+      // fine enough for no gaps, without wasting steps on small curls.
+      const step = Math.min(0.05, 0.7 / (r * Math.max(1, stretch)));
+      let tip = null;
+      for (let a = -Math.PI / 2; a >= end; a -= step) {
+        const ca = Math.cos(a) * stretch, sa = Math.sin(a);
+        const lipColor = a > foamUntil ? R.foam : R.top;
+        for (let k = 0; k <= thick; k++) {
+          const rr = r - k;
+          px(Math.round(cx + rr * ca), Math.round(cy + rr * sa), k < thick ? lipColor : R.top);
+        }
+      }
+      tip = { x: Math.round(cx + (r - 1) * stretch * Math.cos(end)), y: Math.round(cy + (r - 1) * Math.sin(end)) };
+      // Claws: this wave's fringe of foam fingers spilling off the outer
+      // curve — anywhere from none to four, at slightly irregular spacing,
+      // in assorted short lengths, each angled down and forward (left)
+      // rather than hanging straight down.
+      for (let f = 0; f < wave.claws; f++) {
+        const jitter = hash(wave.clawSeed, f) - 0.5;
+        const a = -Math.PI * (0.9 + f * 0.1 + jitter * 0.06);
+        const x = Math.round(cx + (r + S) * stretch * Math.cos(a)), y = Math.round(cy + (r + S) * Math.sin(a));
+        const len = S + Math.floor(hash(wave.clawSeed, f + 10) * (S + 1)); // S to 2S pixels
+        for (let j = 0; j < len; j++) px(x - 1 - (j >> 1), y + j, R.foam);
+      }
+      // Flecks of spray thrown off the top of the biggest crests.
+      if (cr.h > 9 * S) {
+        px(cx + S, cr.y - 2 * S, R.foam);
+        px(cx - 2 * S, cr.y - 3 * S, R.foam);
+        px(cx - S, cr.y - 4 * S, R.foam);
+        if (tip) px(tip.x + S, tip.y, R.foam);
+      }
+    }
+
+    // Rows are evenly spaced in progress and all advance together; each
+    // wraps back to the horizon (with a new pattern) once it's passed the
+    // bottom. Drawn far to near, so nearer crests rise over the troughs behind.
+    // `travel` is how far the boat has gone (in row trips), added up frame
+    // by frame in section 10 rather than read off the clock, so changing
+    // speed never makes the waves jump.
+    //
+    // `swing` is how many pixels turning slides the view this frame
+    // (positive = rightward). Every row slides by exactly that many pixels — near or far, in step
+    // with the sun — which each row keeps as a shift in its own units
+    // (`slotSide`). Recording it in units at the moment of turning is what
+    // keeps the waves spreading out from the middle of the screen, the way
+    // the boat is now heading, as the row grows on its way toward you.
+    const slotSide = new Float64Array(ROWS);
+    function drawSea(travel, swing) {
+      buf.fill(HORIZON_LINE, HORIZON * W, (HORIZON + 1) * W);
+      buf.fill(rowLook(0).body, (HORIZON + 1) * W);
+      const rows = [];
+      for (let slot = 0; slot < ROWS; slot++) {
+        const progress = slot / ROWS + travel;
+        const lap = Math.floor(progress);
+        rows.push({ slot, lap, depth: Math.pow(progress - lap, EASE) * MAX_DEPTH });
+      }
+      rows.sort((a, b) => a.depth - b.depth);
+      const looks = rows.map((row) => rowLook(row.depth));
+      // Shape every row first, so each one knows where the row in front of
+      // it begins…
+      rows.forEach((row, i) => {
+        slotSide[row.slot] -= swing / looks[i].scale; // the pattern shifting forward slides it left
+        shapeRow(patternFor(row.slot, row.lap), looks[i], slotSide[row.slot], i * W);
+      });
+      // …then paint them far to near. Each paints down to the next nearer
+      // row's trough line at most (it covers the rest), or to the bottom of
+      // the screen for the nearest row.
+      rows.forEach((row, i) => {
+        const last = i + 1 === rows.length;
+        const fillTo = last ? H : Math.min(H, Math.ceil(looks[i + 1].base) + 1);
+        drawRow(patternFor(row.slot, row.lap), looks[i], slotSide[row.slot], i * W,
+          last ? NOTHING_IN_FRONT : colSurface, last ? 0 : (i + 1) * W, fillTo);
+      });
+    }
+
+    // =====================================================================
+    // 6. Details: sun glitter on the water, and two gulls.
+    // =====================================================================
+    // The glitter itself is painted inside drawRow, onto the waves; this
+    // just says how strongly a pixel sits in the sun's column: 1 on the
+    // center line, fading to 0 at the edges. The column starts as wide as
+    // the sun at the horizon and widens toward the viewer.
+    const GLITTER_HI = rgb("#ffd27a"), GLITTER_LO = rgb("#f59a5c");
+    function glitterAt(x, y) {
+      const half = SUN_R + Math.max(0, y - HORIZON) * 0.35;
+      return Math.max(0, 1 - Math.abs(x - Math.round(sunX)) / half); // follows the sun as you steer
+    }
+
+    // Gulls: dark dusk silhouettes, drawn from a formula rather than a
+    // fixed grid, so they're fine-grained at this resolution and flap
+    // smoothly. `lift` runs from 1 (wings up) through 0 (level) to -1
+    // (wings down). Each wing bows up at the elbow and bends toward its
+    // tip — the classic shallow "M" of a gull — thicker near the body.
+    const GULL = rgb("#2b2040");
+    const GULL_SPAN = 5.5 * S; // half wingspan, in pixels
+    function drawGull(x, y, lift) {
+      // Body: a small blob in the middle.
+      for (let dx = -1; dx <= 1; dx++) for (let dy = 0; dy <= S; dy++) px(x + dx, y + dy, GULL);
+      for (let i = 1; i <= GULL_SPAN; i++) {
+        const t = i / GULL_SPAN;
+        const tip = -lift * 4 * S * t * t;            // the outer wing swings up or down
+        const elbow = -1.5 * S * Math.sin(Math.PI * t); // the shoulder-to-tip bow
+        const wy = Math.round(y + tip + elbow);
+        const thick = t < 0.5 ? S : 1;                  // tapering toward the tips
+        for (let k = 0; k < thick; k++) {
+          px(x - i, wy + k, GULL);
+          px(x + i, wy + k, GULL);
+        }
+      }
+    }
+
+    // Each flies right at its own pace and alternates a few seconds of easy
+    // flapping with a few seconds of gliding (wings level), on its own
+    // schedule. Every time a gull wraps around and re-enters on the left,
+    // it picks a new altitude — anywhere from high in the sky down to just
+    // above the horizon, low enough to cross the sun — and gently climbs or
+    // descends as it crosses.
+    const GULL_LOOP = W + 30 * S;               // distance flown before wrapping around
+    const GULL_TOP = 22 * S, GULL_LOW = 86 * S; // altitude range (y); the sun spans about 77–100 (×S)
+    const FLAP_RATE = 0.275;                    // wingbeats per second
+    const GULLS = [
+      { x0: 30 * S, speed: 4 * S, phase: 0 },
+      { x0: 190 * S, speed: 5 * S, phase: 2.6 },
+    ];
+    function drawGulls(t) {
+      GULLS.forEach((g, i) => {
+        const flown = g.x0 + t * g.speed;
+        const lap = Math.floor(flown / GULL_LOOP);     // which crossing this is
+        const progress = (flown % GULL_LOOP) / GULL_LOOP; // 0 → 1 across the screen
+        const x = Math.round(flown % GULL_LOOP) - 15 * S;
+        // This crossing's altitude and climb, "random" but the same every
+        // time for a given lap (so it doesn't jitter frame to frame).
+        const altitude = GULL_TOP + hash(lap, i) * (GULL_LOW - GULL_TOP);
+        const climb = (hash(lap, i + 50) - 0.5) * 16 * S * progress;
+        const bob = Math.sin(t * 0.6 + g.phase) * 3 * S;
+        const y = Math.round(Math.min(GULL_LOW, altitude + climb + bob));
+        // Flap for a while, then glide with wings just above level.
+        const flapping = Math.sin(t * 0.4 + g.phase) > -0.2;
+        const lift = flapping ? Math.sin(2 * Math.PI * FLAP_RATE * t + g.phase * 3) : 0.2;
+        drawGull(x, y, lift);
+      });
+    }
+
+    // =====================================================================
+    // 7. The flyer: you — a little flying person, seen from just behind
+    //    (a "chase view"), in a reddish-purple dress, with shoulder-length
+    //    sandy hair and bare feet.
+    //
+    //    Like the gulls, the figure is drawn from shapes rather than a
+    //    fixed grid of pixels, so it can move smoothly: hair and hem
+    //    stream and flutter in the rush of air (harder the faster you
+    //    fly), the body bobs gently, and it leans into turns.
+    //
+    //    Shapes are laid out in "figure units": x across (0 is the middle
+    //    of the body), y down from the top of the head; the figure is
+    //    about 46 units tall. FIG_SCALE turns units into screen pixels.
+    //
+    //    A dark outline all round makes the figure stand out against the
+    //    waves.
+    // =====================================================================
+    const FIG_SCALE = 0.43 * S;  // screen pixels per figure unit
+    const FIG_PIVOT = 22;        // the point (in units down from the head) the figure leans around
+    const FIG_Y = 0.85 * H;      // where that point sits on screen
+    const FIG_LEAN = 0.35;       // how far it leans in a full-lock turn (radians)
+
+    // Materials: what each part is made of, then its colors.
+    const HAIR = 1, HAIR_DARK = 2, HAIR_LIGHT = 3, DRESS = 4, DRESS_DARK = 5, DRESS_LIGHT = 6, SKIN = 7, SKIN_DARK = 8, SOLE = 9;
+    const FIG_COLORS = [0, "#c8923f", "#8f6328", "#ecc46c", "#a3306e", "#6e1f52", "#c84f8a", "#e2a98a", "#a8705c", "#f2c9ac"].map((c) => c && rgb(c));
+    const FIG_OUTLINE = rgb("#2a1630");
+
+    // Distance from point (x, y) to the line segment a–b.
+    function segDist(x, y, ax, ay, bx, by) {
+      const dx = bx - ax, dy = by - ay;
+      const k = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)));
+      return Math.hypot(x - ax - k * dx, y - ay - k * dy);
+    }
+
+    // What material is at figure point (x, y), or 0 for none. `wind` runs
+    // from about 0.25 (hovering) to 1 (full speed). Front to back: hair,
+    // then dress (and bare shoulders), then arms, then legs.
+    // Limbs and locks of hair move with time but not from pixel to pixel,
+    // so drawFlyer works out where they are once per frame, here.
+    const limbs = { hands: [0, 0, 0, 0], feet: [0, 0] };
+
+    // Hair: thick, rope-like locks, almost dreadlocks — each a bent line
+    // from the crown down past the shoulders. Like the gulls' wingbeats,
+    // they cycle through a handful of poses (HAIR_POSES). They have two
+    // paces: barely stirring when you're flying slowly, and a steady flick
+    // at any other speed. The wind also spreads them outward. The locks
+    // are drawn as a chain of segments.
+    //
+    // A few short, thin wisps stray off the top and sides of the head, so
+    // the hair isn't one tidy triangle; they flick with the same poses.
+    const LOCKS = 8, LOCK_JOINTS = 5;  // locks (an even number, so the hair parts down the middle), and points along each (so 4 segments)
+    const LOCK_R = 1.15;               // a lock's thickness (radius, in figure units) at the root
+    const HAIR_POSES = 4;              // poses in the flick cycle
+    const HAIR_SLOW_BELOW = 0.6;       // below this speed (×), the hair barely stirs
+    const HAIR_SLOW = { flicks: 1.2, sway: 0.35 }; // flicks per second, and how far a lock whips side to side
+    const HAIR_REGULAR = { flicks: 5, sway: 0.9 };
+    // How far through the flick cycle the hair is, counted in poses. It's
+    // added to a little each frame at the current pace (rather than worked
+    // out as time × pace), so changing pace never makes it jump or race.
+    let hairClock = 0, lastHairT = null;
+    const lockPts = new Float32Array(LOCKS * LOCK_JOINTS * 2); // x, y of every point, this frame
+    const lockBox = new Float32Array(LOCKS * 2);               // each lock's left and right extent
+
+    // The wisps: where each starts on the head, which way it points (an
+    // angle: 0 is right, π/2 straight down) and how long it is. They hang
+    // down and a little outward from the upper sides of the head, widening
+    // the top of the hair.
+    const WISPS = [
+      { x: -4.4, y: 3.2, angle: Math.PI - 1.15, len: 5 },   // down and a little out on the left
+      { x: 4.5, y: 3.8, angle: 1.15, len: 4.6 },            // down and a little out on the right
+      { x: -4.9, y: 6.2, angle: Math.PI - 1.3, len: 4 },    // a shorter one, lower on the left
+    ];
+    const WISP_JOINTS = 3, WISP_R = 0.55;
+    const wispPts = new Float32Array(WISPS.length * WISP_JOINTS * 2);
+
+    // Sets the locks for this frame: which pose of the cycle we're on, and
+    // how hard the wind is pulling them out.
+    function poseHair(t, wind) {
+      const pace = speed < HAIR_SLOW_BELOW ? HAIR_SLOW : HAIR_REGULAR;
+      if (lastHairT !== null) hairClock += Math.min(t - lastHairT, 0.1) * pace.flicks;
+      lastHairT = t;
+      const pose = Math.floor(hairClock) % HAIR_POSES;
+      const phase = (pose / HAIR_POSES) * 2 * Math.PI;
+      for (let k = 0; k < LOCKS; k++) {
+        const rootX = (k / (LOCKS - 1) - 0.5) * 7.6;            // across the crown
+        const rootY = 2.5 + Math.abs(rootX) * 0.35;
+        const len = 15 + hash(k, 77) * 2.5;                     // not all the same length
+        const spread = rootX * (0.07 + 0.09 * wind);            // outward lean: more in the wind
+        const amp = pace.sway;                                  // how far a lock whips side to side
+        let minX = Infinity, maxX = -Infinity;
+        for (let j = 0; j < LOCK_JOINTS; j++) {
+          const f = j / (LOCK_JOINTS - 1);                      // 0 at the root, 1 at the tip
+          // The hair parts at the nape: the middle locks swing apart toward
+          // their ends, opening a V that shows the neck and upper back.
+          const part = Math.sign(rootX) * 1.6 * Math.max(0, 1 - Math.abs(rootX) / 4) * f * f;
+          const x = rootX + spread * len * f + part + Math.sin(phase + j * 1.3 + k * 2.1) * amp * f;
+          const y = rootY + len * f * (1 - 0.15 * wind);        // the wind lifts them a little
+          lockPts[(k * LOCK_JOINTS + j) * 2] = x;
+          lockPts[(k * LOCK_JOINTS + j) * 2 + 1] = y;
+          minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+        }
+        lockBox[k * 2] = minX - LOCK_R;
+        lockBox[k * 2 + 1] = maxX + LOCK_R;
+      }
+      WISPS.forEach((w, k) => {
+        const ux = Math.cos(w.angle), uy = Math.sin(w.angle); // along the wisp
+        const droop = ux < 0 ? -1 : 1; // which sideways direction bends the tip downward
+        for (let j = 0; j < WISP_JOINTS; j++) {
+          const f = j / (WISP_JOINTS - 1);
+          // A gentle droop toward the tip, plus a flick side to side with the pose.
+          const bend = droop * 0.9 * f * f + Math.sin(phase + j * 1.7 + k * 4) * pace.sway * 0.8 * f;
+          wispPts[(k * WISP_JOINTS + j) * 2] = w.x + ux * w.len * f - uy * bend;
+          wispPts[(k * WISP_JOINTS + j) * 2 + 1] = w.y + uy * w.len * f + ux * bend;
+        }
+      });
+    }
+
+    // The hair at (x, y): the nearest lock, if any is close enough, or the
+    // back of the head showing between them (in shadow). 0 for none.
+    function hairAt(x, y) {
+      // The wisps first — strays lying over the locks. Thin, so plain hair
+      // with a sun-bleached end.
+      for (let k = 0; k < WISPS.length; k++) {
+        for (let j = 0; j < WISP_JOINTS - 1; j++) {
+          const i = (k * WISP_JOINTS + j) * 2;
+          if (segDist(x, y, wispPts[i], wispPts[i + 1], wispPts[i + 2], wispPts[i + 3]) < WISP_R) {
+            return j === WISP_JOINTS - 2 ? HAIR_LIGHT : HAIR;
+          }
+        }
+      }
+      let best = Infinity, along = 0;
+      for (let k = 0; k < LOCKS; k++) {
+        if (x < lockBox[k * 2] || x > lockBox[k * 2 + 1]) continue;
+        for (let j = 0; j < LOCK_JOINTS - 1; j++) {
+          const i = (k * LOCK_JOINTS + j) * 2;
+          const d = segDist(x, y, lockPts[i], lockPts[i + 1], lockPts[i + 2], lockPts[i + 3]);
+          if (d < best) {
+            best = d;
+            along = (j + Math.max(0, Math.min(1, (y - lockPts[i + 1]) / (lockPts[i + 3] - lockPts[i + 1])))) / (LOCK_JOINTS - 1);
+          }
+        }
+      }
+      const r = LOCK_R * (1 - 0.35 * along); // tapering toward the tip
+      if (best < r) {
+        if (best > r - 0.45) return HAIR_DARK;              // the lock's edges, rounding away
+        if (along > 0.82) return HAIR_LIGHT;                // sun-bleached tips
+        return Math.floor(along * 10) % 3 === 0 ? HAIR_DARK : HAIR; // the ropey, matted ridges
+      }
+      // The head itself, between the locks.
+      if ((x / 5) ** 2 + ((y - 6) / 6) ** 2 <= 1) return HAIR_DARK;
+      return 0;
+    }
+
+    // The dress's edges: a tattered hem of uneven, pointed strips that each
+    // flap on their own, and the odd nick out of the sides. Fixed from frame
+    // to frame (except the flapping), so the rips stay put.
+    const TATTER_W = 1.7; // width of a strip of the ragged hem
+    function hemAt(x, t, wind) {
+      const strip = Math.floor((x + 20) / TATTER_W);
+      const u = (x + 20) / TATTER_W - strip;                // 0…1 across the strip
+      const drop = 0.6 + hash(strip, 5) * 3.6;              // how far this strip hangs down
+      const point = drop * (1 - Math.abs(2 * u - 1));       // each strip comes to a point
+      return 33.5 + point + Math.sin(t * 9 + strip * 1.7) * wind * 1.1;
+    }
+    // Where the dress tops out: one shoulder. From behind, the top edge runs
+    // diagonally from her left shoulder down to under her right arm, with
+    // a single strap over the left shoulder.
+    const dressTop = (x) => 17.6 + x * 0.3;
+
+    function figureAt(x, y, t, wind) {
+      const ax = Math.abs(x);
+      if (y < -5 || y > 48 || ax > 15) return 0; // nothing of the figure out here
+      if (y < 23 && ax < 13) {
+        const h = hairAt(x, y);
+        if (h) return h;
+      }
+      // The neck, showing where the hair parts — shadowed just under the head.
+      if (y >= 9 && y < 15 && ax < 1.8) return y < 12.5 ? SKIN_DARK : SKIN;
+      // Torso: the dress below its diagonal top, bare shoulders and back above it.
+      if (y >= 14 && y < 40 && ax < 12) {
+        let half = y < 22 ? 6 - (y - 14) * 0.12 : 5 + (y - 22) * 0.32;
+        if (y > 26) {
+          half += Math.sin(t * 8 + y * 0.6) * 0.5 * wind;
+          if (hash(Math.floor(y * 0.9), x < 0 ? 1 : 2) > 0.72) half -= 0.9; // nicks torn out of the sides
+        }
+        if (ax <= half && y < hemAt(x, t, wind)) {
+          if (segDist(x, y, -4.4, 14.2, -3.4, dressTop(-3.4)) < 0.85) return DRESS_DARK; // the strap
+          if (y < dressTop(x)) return ax > half - 1 ? SKIN_DARK : SKIN;                // bare shoulders and back
+          // A couple of tears, showing what's behind.
+          if (((x - 2.8) / 1.1) ** 2 + ((y - 29.5) / 0.7) ** 2 <= 1) return 0;
+          if (((x + 4.3) / 0.8) ** 2 + ((y - 32.5) / 1.1) ** 2 <= 1) return 0;
+          if (ax > half - 1.2) return DRESS_DARK;                    // the sides turn away from you
+          if (y > 24 && (Math.abs(x - 3) < 0.6 || Math.abs(x + 3.5) < 0.6 || Math.abs(x) < 0.5)) return DRESS_DARK; // folds
+          if (y < dressTop(x) + 2 && ax < 3) return DRESS_LIGHT;     // light across the top
+          return DRESS;
+        }
+      }
+      // Arms: bare, out to the sides and a little down, gliding.
+      if (y > -5 && y < 33) for (let i = 0; i < 2; i++) {
+        const side = i * 2 - 1;
+        const sx = side * 5.5, sy = 15.5;
+        const hx = limbs.hands[i * 2], hy = limbs.hands[i * 2 + 1];
+        const d = segDist(x, y, sx, sy, hx, hy);
+        if (d < 1.4) {
+          const along = (x - sx) / (hx - sx); // 0 at the shoulder, 1 at the hand
+          return y > (sy + (hy - sy) * along) + 0.5 ? SKIN_DARK : SKIN;
+        }
+        if (Math.hypot(x - hx, y - hy - 0.5) < 1.6) return SKIN;
+      }
+      // Legs: trailing below the hem with a slight lazy kick, ending in
+      // bare feet — you see the soles, the boat being ahead of you.
+      if (y > 32 && ax < 7) for (let i = 0; i < 2; i++) {
+        const side = i * 2 - 1;
+        const top = side * 2.6, foot = limbs.feet[i];
+        if (segDist(x, y, top, 34, foot, 42.5) < 1.3) return ax < 2.6 ? SKIN_DARK : SKIN;
+        // Feet: pointed, the way a flyer's would be — from the heel at the
+        // end of the leg, tapering down and a little outward to the toes.
+        // Seen from behind, the soles face you.
+        const toeX = foot + side * 1.3, toeY = 46.8;
+        const along = (y - 42.6) / (toeY - 42.6); // 0 at the heel, 1 at the toes
+        if (along >= 0 && along <= 1 && segDist(x, y, foot, 42.6, toeX, toeY) < 1.25 - 0.7 * along) {
+          return along < 0.2 ? SKIN : SOLE;
+        }
+      }
+      return 0;
+    }
+
+    // Jumping: Space sends her up in an arc and back down — no second jump
+    // until she's back. There's nothing to land on, so she comes down onto
+    // the air like a cushion: dips a little below her flying height and
+    // bounces a few times, each smaller, until she's settled. How high is in her own heights (jumpHeight), which
+    // upgrades will raise. As she pushes off, a faint swirl of air spins
+    // out beneath her from where she left, fading as it widens.
+    const FIG_HEIGHT = 52;          // her height, hair to toes, in figure units
+    const JUMP_TIME = 0.75;         // seconds from leaving to landing
+    let jumpHeight = 1;             // how high she jumps, in her own heights
+    const BOUNCE_DIP = 0.18;        // the first bounce's depth, as a fraction of the jump's height
+    const BOUNCE_PERIOD = 0.36;     // seconds per bounce, down and back up
+    const BOUNCE_DAMPING = 3.5;     // how quickly the bounces die away (higher = sooner)
+    const BOUNCE_TIME = 1.2;        // after this long they're too small to see
+    const SWIRL_TIME = 0.55;        // how long the swirl lasts
+    const SWIRL_ARMS = 3;           // curling streaks in it
+    const SWIRL_ALPHA = 0.7;        // at its brightest
+    const SWIRL_LIGHT = rgb("#e6ecff");
+    const jump = { start: -Infinity };
+
+    function requestJump() {
+      const t = performance.now() / 1000; // the same clock the animation runs on
+      if (t - jump.start >= JUMP_TIME) jump.start = t;
+    }
+
+    // How far she's up off her usual height right now, in screen pixels —
+    // a smooth arc, like a thrown ball, then the settling bounces (which
+    // dip below her usual height, so they're negative at first).
+    function jumpLift(t) {
+      const e = t - jump.start;
+      if (e < 0) return 0;
+      const top = jumpHeight * FIG_HEIGHT * FIG_SCALE;
+      if (e < JUMP_TIME) {
+        const u = e / JUMP_TIME;
+        return 4 * u * (1 - u) * top;
+      }
+      const b = e - JUMP_TIME; // time since she came back down to her flying height
+      if (b >= BOUNCE_TIME) return 0;
+      return -BOUNCE_DIP * top * Math.exp(-BOUNCE_DAMPING * b) * Math.sin(2 * Math.PI * b / BOUNCE_PERIOD);
+    }
+
+    // The swirl: a few curling streaks round a flat (seen-from-the-side)
+    // ellipse under her feet, spinning and spreading as they fade.
+    function drawJumpSwirl(t, cx, groundY) {
+      const k = (t - jump.start) / SWIRL_TIME; // 0 … 1 through its life
+      if (k < 0 || k >= 1) return;
+      const ox = cx, oy = groundY + (44 - FIG_PIVOT) * FIG_SCALE - k * 4 * S; // at her feet, rising a touch
+      const rx = (5 + 11 * k) * S, ry = rx * 0.35;
+      const spin = 5 * k;
+      const fade = SWIRL_ALPHA * (1 - k);
+      for (let arm = 0; arm < SWIRL_ARMS; arm++) {
+        const a0 = arm * 2 * Math.PI / SWIRL_ARMS + spin;
+        const span = 1.7; // radians each streak curls through
+        const steps = Math.ceil(span * rx);
+        for (let j = 0; j <= steps; j++) {
+          const f = j / steps;
+          const a = a0 + span * f;
+          const r = 0.6 + 0.4 * f; // spiralling outward along the streak
+          const x = Math.round(ox + Math.cos(a) * rx * r), y = Math.round(oy + Math.sin(a) * ry * r);
+          const a1 = fade * Math.sin(Math.PI * f); // tapering at both ends
+          for (let dy = 0; dy < 2; dy++) { // two pixels thick, so it holds up against the wave lines
+            if (x < 0 || x >= W || y + dy < 0 || y + dy >= H) continue;
+            tintPx((y + dy) * W + x, SWIRL_LIGHT, dy ? a1 * 0.5 : a1);
+          }
+        }
+      }
+    }
+
+    // Wind lines: faint streaks of air peeling off beneath her feet and
+    // streaming down toward us, so it reads that she's flying. They come
+    // faster, longer and more often the faster she goes — just a few
+    // lazy wisps when she's hovering — and lean away from a turn. Each
+    // stretches and speeds up as it nears us (perspective), fading in and
+    // out. They're measured from her, so they stay with her as she moves.
+    const WIND_RATE = [5, 22];        // streaks a second: hovering … flat out
+    const WIND_FALL = [25, 110];      // how fast they stream down (screen px a second at S = 1 … scaled by S)
+    const WIND_LEN = [2, 9];          // their length, likewise
+    const WIND_LIFE = 0.5;            // seconds each one lasts
+    const WIND_ALPHA = 0.5;           // at its brightest — they're meant to be subtle
+    const WIND_LIGHT = rgb("#e6ecff");
+    const windLines = [];
+    const windRand = seeded(4242);
+    let windLast = null, windDue = 0;
+
+    function drawWindLines(t, cx, cy, turn) {
+      const dt = windLast === null ? 0 : Math.min(0.1, t - windLast);
+      windLast = t;
+      const fast = speed / THROTTLE_MAX; // 0 … 1
+      const mix = (range) => range[0] + (range[1] - range[0]) * fast;
+      // New streaks, from just under her feet.
+      windDue += dt * mix(WIND_RATE);
+      while (windDue >= 1) {
+        windDue -= 1;
+        const side = windRand() * 2 - 1; // -1 … 1 across under her
+        windLines.push({
+          x: side * 9 * FIG_SCALE,
+          y: (40 + windRand() * 7 - FIG_PIVOT) * FIG_SCALE,
+          side, age: 0,
+          life: WIND_LIFE * (0.7 + windRand() * 0.6),
+          fall: mix(WIND_FALL) * S * (0.7 + windRand() * 0.6),
+          len: mix(WIND_LEN) * S * (0.7 + windRand() * 0.6),
+        });
+      }
+      for (let n = windLines.length - 1; n >= 0; n--) {
+        const w = windLines[n];
+        w.age += dt;
+        const k = w.age / w.life;
+        if (k >= 1) { windLines.splice(n, 1); continue; }
+        const grow = 1 + k * 1.5; // nearer us: faster and longer
+        // Mostly straight down, splaying outward a little, and leaning
+        // away from a turn.
+        const dx = w.side * 0.35 - turn * 0.5, dy = 1;
+        const dl = Math.hypot(dx, dy);
+        w.x += dx / dl * w.fall * grow * dt;
+        w.y += dy / dl * w.fall * grow * dt;
+        const len = w.len * grow;
+        const alpha = WIND_ALPHA * Math.min(1, k * 5) * (1 - k); // quick fade in, slow fade out
+        for (let j = 0; j < len; j++) {
+          const x = Math.round(cx + w.x - dx / dl * j), y = Math.round(cy + w.y - dy / dl * j);
+          if (x < 0 || x >= W || y < 0 || y >= H) continue;
+          tintPx(y * W + x, WIND_LIGHT, alpha * (1 - j / len)); // its tail trails off
+        }
+      }
+    }
+
+    // A grid the figure is drawn into first, so edges can be found by
+    // looking at neighbors.
+    const FIG_BOX = Math.ceil(28 * FIG_SCALE); // half-size of the area around the pivot that the figure can reach
+    const FIG_SIZE = 2 * FIG_BOX + 1;
+    const figGrid = new Uint8Array(FIG_SIZE * FIG_SIZE);
+
+    function drawFlyer(t) {
+      const wind = 0.25 + 0.75 * (speed / THROTTLE_MAX);
+      const turn = turnRate / TURN_RATE;                    // -1 (full left) … 1 (full right)
+      const lean = turn * FIG_LEAN;
+      const cos = Math.cos(lean), sin = Math.sin(lean);
+      const pose = updateAttack(t);
+      // A slash pulls her whole body along after the sword (bx, by).
+      const pullX = (pose.bx * cos - pose.by * sin) * FIG_SCALE, pullY = (pose.bx * sin + pose.by * cos) * FIG_SCALE;
+      const cx = Math.round(AHEAD_X + turn * 8 * S + pullX);       // drifts a little toward the turn
+      const groundY = Math.round(FIG_Y + Math.sin(t * 1.2) * 1.5 * S + pullY);
+      const cy = Math.round(groundY - jumpLift(t)); // up in the air, mid-jump
+      for (let i = 0; i < 2; i++) {
+        const side = i * 2 - 1;
+        limbs.hands[i * 2] = side * 12.5;                            // hands out to the sides…
+        limbs.hands[i * 2 + 1] = 26 + Math.sin(t * 1.5 + side) * 1; // …drifting gently up and down
+        limbs.feet[i] = side * 3.2 + Math.sin(t * 2.6 + side * 1.4) * 0.6; // a slight lazy kick
+      }
+      poseHair(t, wind);
+      // The weapon goes down first, so her hand closes over its grip.
+      limbs.hands[2] = pose.hx; // her right hand holds the weapon, wherever the swing has it
+      limbs.hands[3] = pose.hy;
+      drawJumpSwirl(t, cx, groundY);
+      drawWindLines(t, cx, cy, turn);
+      drawSlashMarks(t, cx, cy, cos, sin, pose);
+      drawSlashTrail(t, cx, cy, cos, sin, pose);
+      weapon.draw(pose, cx, cy, cos, sin, t);
+      // Fill the grid: for every screen pixel near the figure, rotate it
+      // back by the lean and ask which material is there.
+      for (let gy = 0; gy < FIG_SIZE; gy++) {
+        for (let gx = 0; gx < FIG_SIZE; gx++) {
+          const dx = gx - FIG_BOX, dy = gy - FIG_BOX;
+          const fx = (dx * cos + dy * sin) / FIG_SCALE;
+          const fy = (-dx * sin + dy * cos) / FIG_SCALE + FIG_PIVOT;
+          figGrid[gy * FIG_SIZE + gx] = figureAt(fx, fy, t, wind);
+        }
+      }
+      // Paint it: inside pixels in their material's color, edge pixels in
+      // the dark outline.
+      const empty = (gx, gy) => gx < 0 || gy < 0 || gx >= FIG_SIZE || gy >= FIG_SIZE || !figGrid[gy * FIG_SIZE + gx];
+      for (let gy = 0; gy < FIG_SIZE; gy++) {
+        for (let gx = 0; gx < FIG_SIZE; gx++) {
+          const m = figGrid[gy * FIG_SIZE + gx];
+          if (!m) continue;
+          let c = FIG_COLORS[m];
+          if (empty(gx - 1, gy) || empty(gx + 1, gy) || empty(gx, gy - 1) || empty(gx, gy + 1)) c = FIG_OUTLINE;
+          px(cx + gx - FIG_BOX, cy + gy - FIG_BOX, c);
+        }
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Weapons. She'll find better ones as she goes; each is an entry in
+    // WEAPONS with its own look (a `draw` function), and `weapon` is the
+    // one in her hand. Weapons are held in her right hand (on your right,
+    // seen from behind) and drawn in the same figure units as she is, so
+    // they bob and lean with her.
+    // ---------------------------------------------------------------------
+    const WEAPONS = {
+      glassScimitar: { name: "Glass scimitar", draw: drawGlassScimitar },
+    };
+    let weapon = WEAPONS.glassScimitar;
+
+    // Mixes `color` into the pixel at index i by `a` (0 = untouched, 1 =
+    // fully `color`) — for see-through things like glass.
+    function tintPx(i, color, a) {
+      const b = buf[i];
+      const ch = (s) => Math.round(((b >>> s) & 255) * (1 - a) + ((color >>> s) & 255) * a) << s;
+      buf[i] = (0xff000000 | ch(16) | ch(8) | ch(0)) >>> 0;
+    }
+
+    // The glass scimitar: a curved blade, all glass, hanging down and out
+    // from her hand as she glides. You see the sea through it, tinted pale
+    // blue-green; the cutting edge is a bright line and the back a darker
+    // one. A faint shine runs the length of the blade, and every few
+    // seconds a glint of warm light slides from hilt to tip — the sunset
+    // catching it.
+    const GLASS_BLADE = 23;          // blade length, in figure units
+    const GLASS_TINT = rgb("#c4ecfa"), GLASS_EDGE = rgb("#f2fcff"), GLASS_BACK = rgb("#a6d6ec");
+    const GLASS_HILT = rgb("#5f93b4"), GLASS_GUARD = rgb("#bfe6f6");
+    const GLASS_SHINE = rgb("#ffffff"), GLASS_GLINT = rgb("#fff1d0");
+    const BLADE_STEPS = 10;
+    const bladePts = new Float32Array((BLADE_STEPS + 1) * 3); // x, y and heading of points along the blade
+    const bladeBox = new Float32Array(BLADE_STEPS * 4);       // each stretch's surrounding box: min x, max x, min y, max y
+    const BLADE_MAX_REACH = 2.3;                               // the widest the blade gets either side of its center line
+
+    function drawGlassScimitar(pose, cx, cy, cos, sin, t) {
+      const hx = pose.hx, hy = pose.hy; // her right hand
+      // The blade's heading (see updateAttack), curving further round
+      // toward the tip (the scimitar's curve).
+      const a0 = pose.a, step = GLASS_BLADE * poseVal(pose, "len") / BLADE_STEPS;
+      const dir = { x: Math.cos(a0), y: Math.sin(a0) };
+      const guardX = hx + dir.x * 1.2, guardY = hy + dir.y * 1.2;
+      let bx = guardX, by = guardY;
+      for (let k = 0; k <= BLADE_STEPS; k++) {
+        const s = k / BLADE_STEPS, a = a0 - 0.6 * s;
+        bladePts[k * 3] = bx; bladePts[k * 3 + 1] = by; bladePts[k * 3 + 2] = a;
+        bx += Math.cos(a) * step;
+        by += Math.sin(a) * step;
+      }
+      for (let k = 0; k < BLADE_STEPS; k++) {
+        const ax = bladePts[k * 3], ay = bladePts[k * 3 + 1], ex = bladePts[k * 3 + 3], ey = bladePts[k * 3 + 4];
+        bladeBox[k * 4] = Math.min(ax, ex) - BLADE_MAX_REACH;
+        bladeBox[k * 4 + 1] = Math.max(ax, ex) + BLADE_MAX_REACH;
+        bladeBox[k * 4 + 2] = Math.min(ay, ey) - BLADE_MAX_REACH;
+        bladeBox[k * 4 + 3] = Math.max(ay, ey) + BLADE_MAX_REACH;
+      }
+      // How far the blade reaches either side of its center line at s
+      // (0 at the guard, 1 at the tip): the cutting edge bellies out
+      // toward the tip, then both sides sweep in to the point.
+      const edgeAt = (s) => (s < 0.8 ? 0.8 + 1.8 * s : (0.8 + 1.44) * (1 - (s - 0.8) / 0.2));
+      const backAt = (s) => (s < 0.8 ? 0.7 : 0.7 * (1 - (s - 0.8) / 0.2));
+      // A glint every few seconds: where along the blade it is (off the
+      // blade most of the time).
+      const glint = ((t * 0.45) % 2.2) - 0.1;
+
+      // Screen position of a figure-unit point (the reverse of drawFlyer's
+      // screen → figure step), to find the area worth checking.
+      const toScreen = (fx, fy) => {
+        const rx = fx * FIG_SCALE, ry = (fy - FIG_PIVOT) * FIG_SCALE;
+        return [cx + rx * cos - ry * sin, cy + rx * sin + ry * cos];
+      };
+      let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+      for (const [fx, fy] of [[hx - 3, hy - 3], [hx + 3, hy + 3], [bx, by], [bladePts[15], bladePts[16]]]) {
+        const [sx, sy] = toScreen(fx, fy);
+        x0 = Math.min(x0, sx); x1 = Math.max(x1, sx); y0 = Math.min(y0, sy); y1 = Math.max(y1, sy);
+      }
+      const pad = 3 * FIG_SCALE;
+      x0 = Math.max(0, Math.floor(x0 - pad)); x1 = Math.min(W - 1, Math.ceil(x1 + pad));
+      y0 = Math.max(0, Math.floor(y0 - pad)); y1 = Math.min(H - 1, Math.ceil(y1 + pad));
+
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const dx = x - cx, dy = y - cy;
+          const fx = (dx * cos + dy * sin) / FIG_SCALE;
+          const fy = (-dx * sin + dy * cos) / FIG_SCALE + FIG_PIVOT;
+          const i = y * W + x;
+          // Hilt: a frosted-glass grip through her hand, and a short
+          // crossguard where the blade begins.
+          if (segDist(fx, fy, hx - dir.x * 1.8, hy - dir.y * 1.8, guardX, guardY) < 0.55) { buf[i] = GLASS_HILT; continue; }
+          if (segDist(fx, fy, guardX + dir.y * 1.4, guardY - dir.x * 1.4, guardX - dir.y * 1.4, guardY + dir.x * 1.4) < 0.45) { buf[i] = GLASS_GUARD; continue; }
+          // Blade: find the nearest stretch of the center line, how far
+          // along the blade that is, and how far to which side.
+          let best = Infinity, s = 0, side = 0;
+          for (let k = 0; k < BLADE_STEPS; k++) {
+            // Skip stretches of blade nowhere near this pixel (most of them).
+            if (fx < bladeBox[k * 4] || fx > bladeBox[k * 4 + 1] || fy < bladeBox[k * 4 + 2] || fy > bladeBox[k * 4 + 3]) continue;
+            const ax = bladePts[k * 3], ay = bladePts[k * 3 + 1], ex = bladePts[k * 3 + 3], ey = bladePts[k * 3 + 4];
+            const vx = ex - ax, vy = ey - ay, len2 = vx * vx + vy * vy;
+            const u = Math.max(0, Math.min(1, ((fx - ax) * vx + (fy - ay) * vy) / len2));
+            const px_ = fx - ax - u * vx, py_ = fy - ay - u * vy;
+            const d = Math.hypot(px_, py_);
+            if (d < best) {
+              best = d;
+              s = (k + u) / BLADE_STEPS;
+              side = (vx * py_ - vy * px_) >= 0 ? 1 : -1; // 1 = the cutting-edge side
+            }
+          }
+          const reach = side > 0 ? edgeAt(s) : backAt(s);
+          if (best >= reach) continue;
+          if (Math.abs(s - glint) < 0.05) { buf[i] = GLASS_GLINT; continue; }  // the passing glint
+          // Edge lines about a screen pixel thick, whatever the scale, so
+          // the blade's outline always reads.
+          const line = 1 / FIG_SCALE;
+          if (side > 0 && best > reach - line) { buf[i] = GLASS_EDGE; continue; } // the cutting edge
+          if (side < 0 && best > reach - line) { buf[i] = GLASS_BACK; continue; } // the back
+          if (side > 0 && Math.abs(best - reach * 0.4) < line / 2) { tintPx(i, GLASS_SHINE, 0.7); continue; } // the shine
+          tintPx(i, GLASS_TINT, 0.5);                                            // the glass itself
+        }
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Attacks: sword slashes. Left click slashes horizontally, right click
+    // vertically. Slashes of the same kind in quick succession alternate
+    // direction — horizontal: right to left, then left to right; vertical:
+    // top to bottom, then back up — and a pause (or switching kind) starts
+    // the sequence over.
+    //
+    // A slash is a short wind-up into the starting pose, the swing itself,
+    // then a recovery back to the resting pose. A click during a slash is
+    // remembered and starts as soon as the swing finishes, so quick clicks
+    // chain into a flurry.
+    //
+    // Poses are where her right hand is and which way the blade points
+    // (an angle: 0 is right, -π/2 up, π/2 down), in figure units. Where a
+    // swing passes in front of her, her body hides the arm and blade —
+    // which is how it would look from behind. A pose can also shift her
+    // whole body (bx, by), so she's pulled along after the sword, and
+    // shorten how the blade looks (len) when it points away from us.
+    // ---------------------------------------------------------------------
+    const SLASH_WINDUP = 0.07, SLASH_SWING = 0.17, SLASH_RECOVER = 0.22; // seconds
+    const CHAIN_WINDOW = 0.6; // a slash this soon after the last one (same kind) goes the other way
+    // Each slash's start, middle and end poses, in its first direction.
+    const SLASHES = {
+      // Right to left, across in front of her at shoulder height. Her body
+      // hooks after it: up and to the right as the sword rises, then
+      // sharply left with the cut.
+      horizontal: [
+        { hx: 13.5, hy: 17, a: -0.15, bx: 2.5, by: -3 },
+        { hx: 7, hy: 8, a: -Math.PI / 2, bx: -1.5, by: -1.5 },
+        { hx: -12, hy: 19, a: -Math.PI + 0.15, bx: -6, by: 0.5 },
+      ],
+      // From overhead straight down past her right side. Halfway through,
+      // the blade points away into the distance, so it shows short (len)
+      // and the chop stays narrow instead of sweeping out to the side.
+      vertical: [
+        { hx: 10, hy: -2, a: -Math.PI / 2 - 0.1, bx: 1, by: -3 },
+        { hx: 11.5, hy: 13, a: 0, len: 0.3, bx: 1, by: 0 },
+        { hx: 8, hy: 30, a: Math.PI / 2 + 0.1, bx: 0.5, by: 4 },
+      ],
+    };
+
+    const attack = {
+      kind: null,      // the slash under way ("horizontal" / "vertical"), or null
+      reverse: false,  // going its second direction
+      start: 0,        // when it started (seconds)
+      from: null,      // the pose it started from
+      queued: null,    // a slash clicked for during this one
+      recorded: false, // whether this slash's swing has finished (and been noted for alternating)
+      lastKind: null, lastReverse: false, lastEnd: -Infinity, // for alternating
+    };
+    let lastPose = null;
+
+    const restPose = (t) => ({ hx: 12.5, hy: 26 + Math.sin(t * 1.5 + 1), a: 1.05 + Math.sin(t * 1.5) * 0.05, len: 1, bx: 0, by: 0 });
+    // What a pose leaves out: the blade at full length, her body unmoved.
+    const POSE_DEFAULTS = { hx: 0, hy: 0, a: 0, len: 1, bx: 0, by: 0 };
+    const poseVal = (p, key) => p[key] ?? POSE_DEFAULTS[key];
+    function lerpPose(p, q, k) {
+      const r = {};
+      for (const key in POSE_DEFAULTS) r[key] = poseVal(p, key) + (poseVal(q, key) - poseVal(p, key)) * k;
+      return r;
+    }
+    // The pose u of the way (0 … 1) through a slash: a smooth curve through
+    // its start, middle and end poses.
+    function slashPose(kind, reverse, u) {
+      if (reverse) u = 1 - u;
+      const [A, M, B] = SLASHES[kind];
+      const k0 = (1 - u) * (1 - u), k1 = 2 * u * (1 - u), k2 = u * u;
+      const r = {};
+      for (const key in POSE_DEFAULTS) {
+        const a = poseVal(A, key), m = poseVal(M, key), b = poseVal(B, key);
+        r[key] = k0 * a + k1 * (2 * m - (a + b) / 2) + k2 * b; // the middle term makes it pass through M halfway
+      }
+      return r;
+    }
+    const swingEase = (u) => 1 - (1 - u) ** 3; // fast off the mark, easing into the follow-through
+
+    function startSlash(kind, t) {
+      const chained = kind === attack.lastKind && t - attack.lastEnd < CHAIN_WINDOW;
+      attack.kind = kind;
+      attack.reverse = chained ? !attack.lastReverse : false;
+      attack.start = t;
+      attack.from = lastPose || restPose(t);
+      attack.queued = null;
+      attack.recorded = false;
+      slashMarks.push({ kind, reverse: attack.reverse, start: t });
+    }
+
+    function requestSlash(kind) {
+      const t = performance.now() / 1000; // the same clock the animation runs on
+      if (attack.kind) attack.queued = kind;
+      else startSlash(kind, t);
+    }
+
+    // Where her hand and blade are now, advancing any slash under way.
+    function updateAttack(t) {
+      let pose = restPose(t);
+      if (attack.kind) {
+        const e = t - attack.start;
+        const startPose = slashPose(attack.kind, attack.reverse, 0);
+        const endPose = slashPose(attack.kind, attack.reverse, 1);
+        if (e < SLASH_WINDUP) {
+          pose = lerpPose(attack.from, startPose, e / SLASH_WINDUP);
+        } else if (e < SLASH_WINDUP + SLASH_SWING) {
+          pose = slashPose(attack.kind, attack.reverse, swingEase((e - SLASH_WINDUP) / SLASH_SWING));
+        } else {
+          // The swing's done: remember it for alternating, then either
+          // go straight into a queued slash or recover to rest.
+          if (!attack.recorded) {
+            attack.recorded = true;
+            attack.lastKind = attack.kind;
+            attack.lastReverse = attack.reverse;
+            attack.lastEnd = t;
+          }
+          const queued = attack.queued;
+          if (queued) {
+            lastPose = endPose;
+            startSlash(queued, t);
+            return updateAttack(t);
+          }
+          const k = (e - SLASH_WINDUP - SLASH_SWING) / SLASH_RECOVER;
+          if (k >= 1) attack.kind = null;
+          else pose = lerpPose(endPose, pose, k * k * (3 - 2 * k));
+        }
+      }
+      lastPose = pose;
+      return pose;
+    }
+
+    // The slash's trail: a faint arc of light where the outer part of the
+    // blade has just been, fading toward its older end — drawn under her,
+    // so it's hidden where it passes in front of her body.
+    const TRAIL_LENGTH = 0.45; // how much of the swing the trail covers
+    const TRAIL_LIGHT = rgb("#f2fcff");
+    const trailTouched = new Set();
+    function drawSlashTrail(t, cx, cy, cos, sin, pose) {
+      if (!attack.kind) return;
+      const e = t - attack.start - SLASH_WINDUP;
+      if (e < 0) return;
+      const now = Math.min(1, e / SLASH_SWING);
+      const fade = Math.max(0, 1 - Math.max(0, e - SLASH_SWING) / 0.1); // dies away just after the swing
+      if (fade <= 0) return;
+      trailTouched.clear();
+      const from = Math.max(0, now - TRAIL_LENGTH);
+      const STEPS = 48; // samples across the swing — enough that the arc is smooth
+      for (let k = 0; k <= STEPS; k++) {
+        const u = from + (now - from) * (k / STEPS);
+        const p = slashPose(attack.kind, attack.reverse, swingEase(u));
+        const strength = (0.15 + 0.4 * (k / STEPS)) * fade; // brighter toward the blade
+        // Walk out along the (curved) blade, marking its outer half.
+        // (Where the blade was, measured from where her body is now.)
+        let bx = p.hx + p.bx - pose.bx, by = p.hy + p.by - pose.by;
+        const step = GLASS_BLADE * poseVal(p, "len") / 24;
+        for (let j = 0; j < 24; j++) {
+          const a = p.a - 0.6 * (j / 24);
+          bx += Math.cos(a) * step;
+          by += Math.sin(a) * step;
+          if (j < 10) continue;
+          const rx = bx * FIG_SCALE, ry = (by - FIG_PIVOT) * FIG_SCALE;
+          const sx = Math.round(cx + rx * cos - ry * sin), sy = Math.round(cy + rx * sin + ry * cos);
+          for (let oy = -1; oy <= 1; oy++) {
+            for (let ox = -1; ox <= 1; ox++) {
+              const x = sx + ox, y = sy + oy;
+              if (x < 0 || x >= W || y < 0 || y >= H) continue;
+              const i = y * W + x;
+              if (trailTouched.has(i)) continue; // each pixel lit once, so overlaps don't pile up
+              trailTouched.add(i);
+              tintPx(i, TRAIL_LIGHT, strength);
+            }
+          }
+        }
+      }
+    }
+
+    // Slash marks: the "wound" each slash leaves on whatever's in front of
+    // her — a long, nearly straight bright gash across the slash's
+    // direction, as if cut into a layer just beyond her rather than traced
+    // along the sword's swing. It's pointed at both ends and widest in the
+    // middle, white with a pale blue rim. Its head races ahead of the blade
+    // (in the slash's direction); once the swing's done it thins out and
+    // shrinks away from its start. It stays where it was cut while she
+    // lurches about. Each slash leaves its own, so quick slashes overlap.
+    // Drawn under her, like the trail.
+    //
+    // Each kind's mark runs `from` → `to` (figure units, in its first
+    // direction; the second direction runs it backward), with a slight
+    // bow: how far, and which way, its middle bulges.
+    const SLASH_WOUNDS = {
+      horizontal: { from: { x: 48, y: -1.25 }, to: { x: -48, y: 12.25 }, bow: { x: 0, y: -4.5 } },
+      vertical: { from: { x: 14.5, y: -35 }, to: { x: 5.5, y: 55 }, bow: { x: 4.5, y: 0 } },
+    };
+    const MARK_WIDTH = 5;      // at its widest, in figure units
+    const MARK_FADE = 0.2;     // seconds it lingers after the swing
+    const MARK_STEPS = 160;    // points along it — enough that it's solid, with no gaps
+    const MARK_CORE = rgb("#ffffff"), MARK_EDGE = rgb("#9fe8ff");
+    const slashMarks = [];
+    const markTouched = new Set();
+
+    function drawSlashMarks(t, cx, cy, cos, sin, body) {
+      const pxStep = 0.5 / FIG_SCALE; // half a screen pixel, in figure units
+      const rim = 1 / FIG_SCALE;      // the rim is a pixel wide
+      for (let m = slashMarks.length - 1; m >= 0; m--) {
+        const mark = slashMarks[m];
+        const e = t - mark.start - SLASH_WINDUP;
+        if (e < 0) continue;
+        const gone = Math.max(0, e - SLASH_SWING) / MARK_FADE; // 0 … 1 through the fade
+        if (gone >= 1) { slashMarks.splice(m, 1); continue; }
+        const head = Math.min(1, e / (SLASH_SWING * 0.75)); // reaches the far end before the blade does
+        const { from, to, bow } = SLASH_WOUNDS[mark.kind];
+        const [A, B] = mark.reverse ? [to, from] : [from, to];
+        markTouched.clear();
+        for (let k = 0; k <= MARK_STEPS; k++) {
+          const v = k / MARK_STEPS; // 0 at the start of the cut, 1 at its end
+          if (v > head || v < gone) continue;
+          // The point v of the way along, and the way the line runs there.
+          const b = 4 * v * (1 - v), db = 4 - 8 * v;
+          // (Measured from where her body is now, so it stays where it was cut.)
+          const x = A.x + (B.x - A.x) * v + bow.x * b - body.bx, y = A.y + (B.y - A.y) * v + bow.y * b - body.by;
+          const tx = B.x - A.x + bow.x * db, ty = B.y - A.y + bow.y * db;
+          const tl = Math.hypot(tx, ty) || 1;
+          const nx = -ty / tl, ny = tx / tl;
+          // Widest in the middle, tapering to points.
+          const half = MARK_WIDTH / 2 * Math.sin(Math.PI * v) ** 0.7 * (1 - gone);
+          for (let d = -half; d <= half; d += pxStep) {
+            const fx = x + nx * d, fy = y + ny * d;
+            const rx = fx * FIG_SCALE, ry = (fy - FIG_PIVOT) * FIG_SCALE;
+            const sx = Math.round(cx + rx * cos - ry * sin), sy = Math.round(cy + rx * sin + ry * cos);
+            if (sx < 0 || sx >= W || sy < 0 || sy >= H) continue;
+            const i = sy * W + sx;
+            if (markTouched.has(i)) continue;
+            markTouched.add(i);
+            const edge = Math.abs(d) > half - rim; // a pale blue rim, white inside
+            tintPx(i, edge ? MARK_EDGE : MARK_CORE, (edge ? 0.7 : 0.9) * (1 - gone * 0.5));
+          }
+        }
+      }
+    }
+
+    // =====================================================================
+    // 8. Controls.
+    //    Throttle: hold ↑ or W to speed up, ↓ or S to slow down (all the way to a
+    //    stop). The keys move the throttle; the boat's actual speed eases
+    //    toward it, so it builds up and coasts down rather than jumping.
+    //    Speeds are multiples of scene 2's (1× = TRIP_SECONDS per row).
+    //    Steering: hold ← / → (or A / D) to turn the boat that way. The whole
+    //    view swings — sun, clouds and waves together. Turning eases in and
+    //    out, and needs way on: below 1× the boat turns more slowly, and a
+    //    stopped boat only drifts round.
+    //    M shows or hides the chart (section 9); F the frame-time readout
+    //    (section 10).
+    // =====================================================================
+    const THROTTLE_MAX = 9; // top speed, as a multiple of scene 2's
+    const THROTTLE_RATE = 1;  // how fast holding a key moves the throttle, per second
+    const RESPONSE = 3;     // how quickly the speed catches up to the throttle (higher = snappier)
+    const TURN_RATE = 12 * Math.PI / 180; // turning speed at full lock, at 1× and faster (12° a second)
+    const STEER_FLOOR = 0.2;    // how much a stopped boat can still drift round (as if at 0.2× speed)
+    const STEER_RESPONSE = 2.5; // how quickly turning starts and stops (higher = snappier)
+    let throttle = 1, speed = 1;
+    let turnRate = 0;             // current turning speed, radians per second (negative = left)
+    let lastAdjusted = -Infinity; // when the throttle last moved — the speed bar shows for a while after
+    const held = new Set();
+    // The arrow keys, mirrored on W/A/S/D. Physical keys (e.code), not the
+    // characters they type, so they work whatever Caps Lock is doing.
+    const FASTER = ["ArrowUp", "KeyW"];
+    const SLOWER = ["ArrowDown", "KeyS"];
+    const LEFT = ["ArrowLeft", "KeyA"];
+    const RIGHT = ["ArrowRight", "KeyD"];
+    const CONTROL_KEYS = [...FASTER, ...SLOWER, ...LEFT, ...RIGHT];
+    const anyHeld = (codes) => codes.some((c) => held.has(c));
+
+    addEventListener("keydown", (e) => {
+      if (CONTROL_KEYS.includes(e.code)) {
+        held.add(e.code);
+        e.preventDefault(); // don't scroll the page
+      }
+    });
+    addEventListener("keydown", (e) => {
+      if (e.code === "KeyM" && !e.repeat) showChart = !showChart;
+      if (e.code === "KeyF" && !e.repeat) showFrameTime = !showFrameTime;
+      if (e.code === "Space") {
+        e.preventDefault(); // don't scroll the page
+        if (!e.repeat) requestJump();
+      }
+    });
+    addEventListener("keyup", (e) => held.delete(e.code));
+    // Mouse: left click slashes horizontally, right click vertically (and
+    // doesn't open the browser's menu).
+    addEventListener("mousedown", (e) => {
+      if (e.button === 0) requestSlash("horizontal");
+      if (e.button === 2) requestSlash("vertical");
+    });
+    addEventListener("contextmenu", (e) => e.preventDefault());
+    addEventListener("blur", () => held.clear()); // a key released while the window wasn't listening
+
+    function updateThrottle(t, dt) {
+      const step = THROTTLE_RATE * dt;
+      let next = throttle;
+      if (anyHeld(FASTER)) next += step;
+      if (anyHeld(SLOWER)) next -= step; // holding both ways at once cancels out
+      next = Math.min(THROTTLE_MAX, Math.max(0, next));
+      if (next !== throttle) lastAdjusted = t;
+      throttle = next;
+      speed += (throttle - speed) * (1 - Math.exp(-RESPONSE * dt));
+    }
+
+    function updateSteering(dt) {
+      const dir = (anyHeld(RIGHT) ? 1 : 0) - (anyHeld(LEFT) ? 1 : 0);
+      const target = dir * TURN_RATE * Math.min(1, Math.max(speed, STEER_FLOOR));
+      turnRate += (target - turnRate) * (1 - Math.exp(-STEER_RESPONSE * dt));
+    }
+
+    // A small speed bar in the bottom-left corner while you're adjusting
+    // (and two seconds after): the fill is the current speed, the tick
+    // marks 1×.
+    const BAR_TRACK = rgb("#07102a"), BAR_FILL = rgb("#e6eef6"), BAR_TICK = rgb("#ff8a4c");
+    function drawSpeedBar(t) {
+      if (t - lastAdjusted > 2) return;
+      const x0 = view.left + 4 * S, y0 = view.bottom - 7 * S, w = 40 * S, h = 3 * S;
+      for (let y = y0 - 1; y <= y0 + h; y++) for (let x = x0 - 1; x <= x0 + w; x++) px(x, y, BAR_TRACK);
+      const filled = Math.round((speed / THROTTLE_MAX) * w);
+      for (let y = y0; y < y0 + h; y++) for (let x = x0; x < x0 + filled; x++) px(x, y, BAR_FILL);
+      const tick = x0 + Math.round(w / THROTTLE_MAX);
+      for (let y = y0 - 1; y <= y0 + h; y++) px(tick, y, BAR_TICK);
+    }
+
+    // =====================================================================
+    // 9. The map: a finite square of sea the boat moves around on.
+    //    Positions are in metres, x running east and y running south (so
+    //    north is up on the chart). Headings are compass bearings in
+    //    radians: 0 north, π/2 east, π south, 3π/2 west.
+    //
+    //    The map wraps around: sail off one edge and you come back in at
+    //    the opposite edge, still heading the same way.
+    //
+    //    The chart in the top-right corner shows the map: the edge, the
+    //    water you've been close enough to see (filled in as you go — the
+    //    start of "exploring"), and the boat with its heading.
+    //
+    //    The wind blows one way across the map, so which way the clouds
+    //    drift depends on your heading.
+    // =====================================================================
+    const MAP_SIZE = 4000;              // metres each way (≈ 13 min to cross at 1×, 1½ min at full speed)
+    const SPEED_1X = 5;                 // metres per second at 1× (about 10 knots)
+    const SUN_BEARING = 1.5 * Math.PI;  // the sun sets due west
+    const MOON_BEARING = 0.75 * Math.PI; // the moon hangs southeast
+    const WIND_BEARING = 0;             // the wind blows north (rightward across the view when facing the sun)
+
+    // How wide the view is: pixels of screen per radian of turn (about an
+    // 80° field of view across the screen).
+    const PX_PER_RAD = 229 * S;
+    const wrapAngle = (a) => a - 2 * Math.PI * Math.floor((a + Math.PI) / (2 * Math.PI)); // into -π…π
+
+    // Mid-sea, heading just south of the sunset, so the sun sits right of
+    // straight ahead (at SUN_X) as in the earlier scenes.
+    const boat = { x: MAP_SIZE / 2, y: MAP_SIZE / 2, heading: SUN_BEARING - (SUN_X - AHEAD_X) / PX_PER_RAD };
+
+    // The unit vector a compass bearing points along.
+    const forwardOf = (b) => ({ x: Math.sin(b), y: -Math.cos(b) });
+
+    // Keeps a position on the map, wrapping off one edge onto the other.
+    const wrapMap = (v) => ((v % MAP_SIZE) + MAP_SIZE) % MAP_SIZE;
+
+    // Moves the boat along its heading (wrapping round at the edges) and
+    // returns how far it moved.
+    function moveBoat(dt) {
+      const f = forwardOf(boat.heading);
+      const dist = dt * speed * SPEED_1X;
+      const moved = { x: f.x * dist, y: f.y * dist };
+      boat.x = wrapMap(boat.x + moved.x);
+      boat.y = wrapMap(boat.y + moved.y);
+      return moved;
+    }
+
+    const CHART = 34 * S;                                    // the chart's size on screen, in pixels
+    const chartX = () => view.right - CHART - 4 * S;         // top-right corner of what's visible
+    const chartY = () => view.top + 4 * S;
+    const SEEN_RADIUS = 250;                                 // metres around the boat that count as explored
+    const seen = new Uint8Array(CHART * CHART);              // one flag per chart pixel
+    const CHART_EDGE = rgb("#9d93c4"), CHART_DARK = rgb("#0e0c1a"), CHART_SEEN = rgb("#25497e");
+    const CHART_BOAT = rgb("#ffd27a"), CHART_BOW = rgb("#fff6d8");
+    let showChart = true;
+
+    // Half this color, half whatever is already on screen there — so the
+    // chart is see-through. (Halving each byte of both and adding them
+    // averages all four channels at once.)
+    function blendPx(x, y, color) {
+      if (x < 0 || x >= W || y < 0 || y >= H) return;
+      const i = y * W + x;
+      buf[i] = (((buf[i] >>> 1) & 0x7f7f7f7f) + ((color >>> 1) & 0x7f7f7f7f)) | 0xff000000;
+    }
+
+    function markSeen() {
+      const k = CHART / MAP_SIZE; // chart pixels per metre
+      const bx = boat.x * k, by = boat.y * k, r = SEEN_RADIUS * k;
+      for (let y = Math.floor(by - r); y <= by + r; y++) {
+        for (let x = Math.floor(bx - r); x <= bx + r; x++) {
+          // Wrapped like the map, so seeing across an edge marks both sides.
+          if ((x - bx) ** 2 + (y - by) ** 2 <= r * r) seen[(((y % CHART) + CHART) % CHART) * CHART + (((x % CHART) + CHART) % CHART)] = 1;
+        }
+      }
+    }
+
+    function drawChart() {
+      if (!showChart) return;
+      const CHART_X = chartX(), CHART_Y = chartY();
+      for (let y = -1; y <= CHART; y++) {
+        for (let x = -1; x <= CHART; x++) {
+          const edge = x < 0 || y < 0 || x === CHART || y === CHART;
+          blendPx(CHART_X + x, CHART_Y + y, edge ? CHART_EDGE : seen[y * CHART + x] ? CHART_SEEN : CHART_DARK);
+        }
+      }
+      // The boat: a small square, with a short line out of it pointing
+      // the way it's heading.
+      const k = CHART / MAP_SIZE;
+      const bx = CHART_X + boat.x * k, by = CHART_Y + boat.y * k;
+      for (let i = 2; i <= 3 * S; i++) {
+        px(Math.round(bx + Math.sin(boat.heading) * i), Math.round(by - Math.cos(boat.heading) * i), CHART_BOW);
+      }
+      for (let dy = -1; dy <= 0; dy++) for (let dx = -1; dx <= 0; dx++) px(Math.round(bx) + dx, Math.round(by) + dy, CHART_BOAT);
+    }
+
+    // =====================================================================
+    // 10. Draw it. The sky gradient only changes when you turn (it's
+    //    darker facing away from the sun), so it's saved and only redrawn
+    //    when that changes; every frame copies it back and stacks the
+    //    moving parts on top — stars, the sun and moon (which turning
+    //    swings), clouds in front of them, gulls, the sea, then the speed
+    //    bar and chart.
+    // =====================================================================
+    const SKY_SHADES = 64; // how finely the sky's darkening steps as you turn
+    const skyLayer = new Uint32Array(W * HORIZON);
+    let skyShade = -1;
+    // Puts the sky for the current heading into the frame, redrawing the
+    // saved copy first if the heading's moved it to a new shade.
+    function paintSky() {
+      const away = (1 - Math.cos(boat.heading - SUN_BEARING)) / 2; // 0 facing the sun … 1 facing away
+      const shade = Math.round(away * SKY_SHADES);
+      if (shade !== skyShade) {
+        skyShade = shade;
+        drawSky(skyToward(shade / SKY_SHADES));
+        shadeClouds(shade / SKY_SHADES);
+        skyLayer.set(buf.subarray(0, W * HORIZON));
+      } else {
+        buf.set(skyLayer);
+      }
+    }
+
+    // The frame-time readout (F): how long each frame's work takes, in
+    // milliseconds — in total, then the sea and the flyer on their own —
+    // and the frames per second actually being shown. A frame has about
+    // 16.7 ms to finish for a steady 60 fps, so the first number is how
+    // much of that budget the scene is using. All smoothed so they're
+    // readable rather than flickering.
+    let showFrameTime = false;
+    let workMs = 0, seaMs = 0, flyerMs = 0, frameGap = 1 / 60;
+    const smooth = (avg, now) => avg + (now - avg) * 0.05;
+    function drawFrameTime() {
+      if (!showFrameTime) return;
+      const text = workMs.toFixed(1) + " ms (sea " + seaMs.toFixed(1) + ", flyer " + flyerMs.toFixed(1) + ") · " + Math.round(1 / frameGap) + " fps";
+      ctx.font = 6 * S + "px ui-monospace, Consolas, monospace";
+      ctx.textBaseline = "top";
+      const x = view.left + 4 * S, y = view.top + 4 * S;
+      ctx.fillStyle = "rgba(14, 12, 26, 0.75)";
+      ctx.fillRect(x - S, y - S, ctx.measureText(text).width + 2 * S, 8 * S);
+      ctx.fillStyle = workMs > 12 ? "#ff8a4c" : "#e6eef6"; // orange when getting close to the budget
+      ctx.fillText(text, x, y);
+    }
+
+    let travel = 0, last = null;
+    function frame(ms) {
+      requestAnimationFrame(frame);
+      const started = performance.now();
+      const t = ms / 1000;
+      const dt = last === null ? 0 : Math.min(t - last, 0.1); // capped, so a hidden tab doesn't lurch forward
+      last = t;
+      updateThrottle(t, dt);
+      updateSteering(dt);
+      boat.heading = (boat.heading + turnRate * dt + 2 * Math.PI) % (2 * Math.PI);
+      // How far turning slides everything across the screen this frame
+      // (turning right slides the view left).
+      const swing = -turnRate * dt * PX_PER_RAD;
+      const moved = moveBoat(dt);
+      markSeen();
+      const f = forwardOf(boat.heading);
+      const ahead = moved.x * f.x + moved.y * f.y; // metres gained along the heading
+      travel += ahead / (SPEED_1X * TRIP_SECONDS);
+      const pace = dt > 0 ? ahead / dt / SPEED_1X : 0; // how fast we're really going, in ×
+      // The sun stays at its bearing; it's on screen when the boat faces
+      // within the view's width of west.
+      sunX = AHEAD_X + wrapAngle(SUN_BEARING - boat.heading) * PX_PER_RAD;
+      moonX = AHEAD_X + wrapAngle(MOON_BEARING - boat.heading) * PX_PER_RAD;
+      updateClouds(dt, pace, swing, Math.sin(WIND_BEARING - boat.heading));
+      paintSky();
+      drawStars(t);
+      drawSun();
+      drawMoon();
+      for (const c of clouds) drawCloud(c);
+      drawGulls(t); // after the stars, so a star can never twinkle on top of a gull
+      const seaStart = performance.now();
+      drawSea(travel, swing);
+      const flyerStart = performance.now();
+      drawFlyer(t);
+      seaMs = smooth(seaMs, flyerStart - seaStart);
+      flyerMs = smooth(flyerMs, performance.now() - flyerStart);
+      drawSpeedBar(t);
+      drawChart();
+      ctx.putImageData(image, 0, 0);
+      // Smoothed timings for the readout (drawn on top, after the pixels).
+      workMs = smooth(workMs, performance.now() - started);
+      if (dt > 0) frameGap = smooth(frameGap, dt);
+      drawFrameTime();
+    }
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>

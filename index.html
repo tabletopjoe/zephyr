@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>zephyr</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0e0c1a; overflow: hidden; }
+    body { display: flex; }
+
+    /* Left margin: one numbered tab per page, stacked from the top. */
+    nav {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px;
+      flex-shrink: 0;
+    }
+    nav button {
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      border: 2px solid #3a3566;
+      border-radius: 0; /* square, to suit the pixel art */
+      background: #1b1838;
+      color: #9d93c4;
+      font: bold 13px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+      cursor: pointer;
+    }
+    nav button:hover { border-color: #7a3b73; color: #fff6d8; }
+    nav button[aria-current="true"] { background: #e0625f; border-color: #ffc27a; color: #1b1838; }
+
+    /* The selected page fills the rest of the window. Each page is its own
+       document, so its code, animation loop and scaling stay self-contained. */
+    iframe { flex: 1; border: 0; display: block; height: 100%; }
+  </style>
+</head>
+<body>
+  <nav aria-label="Pages"></nav>
+  <iframe title="Page"></iframe>
+  <script>
+    // Tab 1 is the game itself; the tabs after it will be the game's menus,
+    // modes and options. To add one: put its page in pages/ and add a line
+    // here. Tabs are numbered in this order.
+    const PAGES = [
+      { file: "pages/game.html", title: "Play (↑/W faster, ↓/S slower, ←/→ or A/D turn, M chart, F frame time, click / right-click to slash, Space to jump)" },
+    ];
+
+    const nav = document.querySelector("nav");
+    const frame = document.querySelector("iframe");
+
+    const buttons = PAGES.map((page, i) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = i + 1;
+      b.title = page.title;
+      b.addEventListener("click", () => { location.hash = i + 1; });
+      nav.appendChild(b);
+      return b;
+    });
+
+    // The URL hash (#1, #2, …) says which page is showing, so a refresh or
+    // a bookmark lands on the same one.
+    function show() {
+      const n = parseInt(location.hash.slice(1), 10);
+      const i = n >= 1 && n <= PAGES.length ? n - 1 : 0;
+      if (frame.getAttribute("src") !== PAGES[i].file) frame.src = PAGES[i].file;
+      frame.title = PAGES[i].title;
+      buttons.forEach((b, j) => b.setAttribute("aria-current", String(j === i)));
+    }
+    addEventListener("hashchange", show);
+    show();
+
+    // Hand keyboard focus to the page, so the game hears its keys without
+    // having to be clicked first — whenever a page loads, and after a tab
+    // is clicked (which otherwise keeps focus on the tab button).
+    const focusPage = () => frame.contentWindow && frame.contentWindow.focus();
+    frame.addEventListener("load", focusPage);
+    nav.addEventListener("click", () => setTimeout(focusPage));
+  </script>
+</body>
+</html>
