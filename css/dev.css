@@ -1,0 +1,92 @@
+/* Shared look for the development pages (enemy index, map index): a list
+   to pick from on the left, a preview and its details on the right, in
+   the shell's dusk colors. */
+html, body { margin: 0; height: 100%; background: #0e0c1a; color: #d9d2f0; }
+[hidden] { display: none !important; }
+body {
+  display: flex;
+  font: 13px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  overflow: hidden;
+}
+
+.list {
+  width: 200px;
+  flex-shrink: 0;
+  padding: 12px 10px;
+  border-right: 2px solid #2a2550;
+  overflow-y: auto;
+}
+.list h2 {
+  margin: 14px 4px 6px;
+  font-size: 11px;
+  font-weight: normal;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #7d74a8;
+}
+.list h2:first-child { margin-top: 0; }
+.list button {
+  display: block;
+  width: 100%;
+  margin-bottom: 4px;
+  padding: 6px 8px;
+  border: 2px solid #3a3566;
+  border-radius: 0;
+  background: #1b1838;
+  color: #9d93c4;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.list button:hover { border-color: #7a3b73; color: #fff6d8; }
+.list button[aria-current="true"] { background: #e0625f; border-color: #ffc27a; color: #1b1838; }
+
+main {
+  flex: 1;
+  min-width: 0;
+  padding: 14px 18px;
+  overflow-y: auto;
+}
+main h1 { margin: 0 0 2px; font-size: 18px; color: #fff6d8; }
+main .sub { margin: 0 0 12px; color: #9d93c4; }
+
+.preview {
+  display: block;
+  width: 100%;
+  max-width: 960px;
+  border: 2px solid #2a2550;
+  image-rendering: pixelated;
+  background: #1b1838;
+}
+.hover { min-height: 1.45em; margin: 6px 0 0; color: #b8afd8; }
+
+.details { margin-top: 14px; max-width: 960px; border-collapse: collapse; }
+.details th, .details td { padding: 4px 14px 4px 0; vertical-align: top; text-align: left; }
+.details th { font-weight: normal; color: #7d74a8; white-space: nowrap; }
+.details td { color: #e8e2fa; }
+
+.swatches { display: flex; flex-wrap: wrap; gap: 6px 12px; }
+.swatch { display: inline-flex; align-items: center; gap: 5px; }
+.swatch i { width: 12px; height: 12px; border: 1px solid #0e0c1a; display: inline-block; }
+
+/* Rows of buttons choosing a variant of the shown item (form, colorway). */
+.choices { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 0 0 8px; }
+.choices span { width: 76px; color: #7d74a8; }
+.choices button {
+  padding: 3px 8px 3px 6px;
+  border: 2px solid #3a3566;
+  border-radius: 0;
+  background: #1b1838;
+  color: #9d93c4;
+  font: inherit;
+  cursor: pointer;
+}
+.choices button::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 6px; background: var(--chip, transparent); border: 1px solid #0e0c1a; vertical-align: -1px; }
+.choices button:not([style])::before { display: none; }
+.choices button:hover { border-color: #7a3b73; color: #fff6d8; }
+.choices button[aria-current="true"] { border-color: #ffc27a; color: #fff6d8; }
+
+/* A second list beside the first, for what is in the chosen item (the
+   terrain on a map, say). */
+.list.assets { width: 170px; background: #13112a; }
+.list button .count { float: right; opacity: 0.7; }

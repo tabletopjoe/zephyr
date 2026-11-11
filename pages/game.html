@@ -15,6 +15,12 @@
 </head>
 <body>
   <canvas id="c"></canvas>
+  <!-- Shared with the index pages: pixel helpers, enemies, terrain, maps. -->
+  <script src="../js/pixels.js"></script>
+  <script src="../js/tabkeys.js"></script>
+  <script src="../js/enemies.js"></script>
+  <script src="../js/terrain.js"></script>
+  <script src="../js/maps.js"></script>
   <script>
     // =====================================================================
     // 1. A tiny canvas, drawn by writing pixels straight into a buffer.
@@ -35,11 +41,7 @@
     // One 32-bit number per pixel — far faster than thousands of fillRect calls.
     const buf = new Uint32Array(image.data.buffer);
 
-    // "#rrggbb" → the 32-bit pixel format ImageData uses (bytes are A,B,G,R).
-    function rgb(hex) {
-      const n = parseInt(hex.slice(1), 16);
-      return (0xff000000 | ((n & 0xff) << 16) | (n & 0xff00) | ((n >> 16) & 0xff)) >>> 0;
-    }
+    // (rgb(), mix(), bayer() and hash() come from js/pixels.js.)
     function px(x, y, color) {
       x |= 0; y |= 0;
       if (x >= 0 && x < W && y >= 0 && y < H) buf[y * W + x] = color;
@@ -63,20 +65,9 @@
     fit();
 
     // =====================================================================
-    // 2. Helpers: dithering, deterministic noise, seeded randomness.
+    // 2. Helpers: seeded randomness. (Dithering and repeatable noise —
+    //    bayer() and hash() — are shared, in js/pixels.js.)
     // =====================================================================
-    // A 4×4 Bayer matrix: per-pixel thresholds that turn a smooth blend
-    // between two colors into a checkerboard-ish pattern — the classic
-    // pixel-art way to fake gradients with few colors.
-    const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16);
-    const bayer = (x, y) => BAYER[(y & 3) * 4 + (x & 3)];
-
-    // Same inputs → same "random" number in [0, 1), for sparkle and texture.
-    function hash(a, b) {
-      let h = (Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263)) | 0;
-      h = Math.imul(h ^ (h >>> 13), 1274126177);
-      return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
-    }
     // Seeded random sequence, so the stars land in the same place every load.
     function seeded(seed) {
       return () => {
@@ -380,13 +371,6 @@
     const TRIP_SECONDS = 20;   // how long one row takes from the horizon to gone at 1× throttle
     const EASE = 2;            // how sharply rows speed up as they approach (1 = no speed-up)
     const HORIZON_LINE = rgb("#d98a7f");
-
-    // Blend two "#rrggbb" colors; t = 0 gives a, t = 1 gives b.
-    function mix(a, b, t) {
-      const pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16);
-      const ch = (s) => Math.round(((pa >> s) & 255) * (1 - t) + ((pb >> s) & 255) * t);
-      return rgb("#" + ((ch(16) << 16) | (ch(8) << 8) | ch(0)).toString(16).padStart(6, "0"));
-    }
 
     // How a row looks at a given depth — the same formulas as scene 1's
     // fixed rows, but now evaluated continuously as the row approaches.
@@ -696,8 +680,13 @@
     // (`slotSide`). Recording it in units at the moment of turning is what
     // keeps the waves spreading out from the middle of the screen, the way
     // the boat is now heading, as the row grows on its way toward you.
+    //
+    // `things` are what's out on the water (terrain and enemies), each with a
+    // depth and a draw(), sorted far to near. Each is painted just before
+    // the first row nearer than it, so that row and the ones in front hide
+    // whatever of it is below their crests.
     const slotSide = new Float64Array(ROWS);
-    function drawSea(travel, swing) {
+    function drawSea(travel, swing, things = []) {
       buf.fill(HORIZON_LINE, HORIZON * W, (HORIZON + 1) * W);
       buf.fill(rowLook(0).body, (HORIZON + 1) * W);
       const rows = [];
@@ -717,12 +706,16 @@
       // …then paint them far to near. Each paints down to the next nearer
       // row's trough line at most (it covers the rest), or to the bottom of
       // the screen for the nearest row.
+      let next = 0;
+      const drawThingsBeyond = (depth) => { while (next < things.length && things[next].depth < depth) things[next++].draw(); };
       rows.forEach((row, i) => {
+        drawThingsBeyond(looks[i].depth);
         const last = i + 1 === rows.length;
         const fillTo = last ? H : Math.min(H, Math.ceil(looks[i + 1].base) + 1);
         drawRow(patternFor(row.slot, row.lap), looks[i], slotSide[row.slot], i * W,
           last ? NOTHING_IN_FRONT : colSurface, last ? 0 : (i + 1) * W, fillTo);
       });
+      drawThingsBeyond(Infinity); // anything nearer than every row
     }
 
     // =====================================================================
@@ -814,6 +807,7 @@
     const FIG_PIVOT = 22;        // the point (in units down from the head) the figure leans around
     const FIG_Y = 0.85 * H;      // where that point sits on screen
     const FIG_LEAN = 0.35;       // how far it leans in a full-lock turn (radians)
+    const herScreen = { x: W / 2, y: FIG_Y }; // where her pivot was last drawn: for squids to lash at, and slashes to reach from
 
     // Materials: what each part is made of, then its colors.
     const HAIR = 1, HAIR_DARK = 2, HAIR_LIGHT = 3, DRESS = 4, DRESS_DARK = 5, DRESS_LIGHT = 6, SKIN = 7, SKIN_DARK = 8, SOLE = 9;
@@ -831,8 +825,29 @@
     // from about 0.25 (hovering) to 1 (full speed). Front to back: hair,
     // then dress (and bare shoulders), then arms, then legs.
     // Limbs and locks of hair move with time but not from pixel to pixel,
-    // so drawFlyer works out where they are once per frame, here.
-    const limbs = { hands: [0, 0, 0, 0], feet: [0, 0] };
+    // so drawFlyer works out where they are once per frame (see poseBody),
+    // here.
+    const limbs = {
+      hands: [0, 0, 0, 0],  // left (free) hand x, y, then right (sword) hand
+      elbow: [0, 0],        // her free arm's elbow (the sword arm's is just its middle)
+      lift: 0,              // how far her shoulders have risen (breathing, hunching)
+      head: [0, 0],         // how far her head and hair have moved
+      knees: [0, 0, 0, 0], heels: [0, 0, 0, 0], toes: [0, 0, 0, 0], // left x, y, then right
+    };
+    // Distance from point (x, y) to segment a–b, like segDist, also noting
+    // in segK how far along it (0 … 1) the nearest point is.
+    let segK = 0;
+    function segNear(x, y, ax, ay, bx, by) {
+      const dx = bx - ax, dy = by - ay;
+      segK = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy || 1)));
+      return Math.hypot(x - ax - segK * dx, y - ay - segK * dy);
+    }
+    // An arm's material along segment a–b, if (x, y) is on it: shadowed
+    // on its underside.
+    function limbAt(x, y, ax, ay, bx, by) {
+      if (segNear(x, y, ax, ay, bx, by) >= 1.4) return 0;
+      return y > ay + (by - ay) * segK + 0.5 ? SKIN_DARK : SKIN;
+    }
 
     // Hair: thick, rope-like locks, almost dreadlocks — each a bent line
     // from the crown down past the shoulders. Like the gulls' wingbeats,
@@ -966,55 +981,61 @@
       const ax = Math.abs(x);
       if (y < -5 || y > 48 || ax > 15) return 0; // nothing of the figure out here
       if (y < 23 && ax < 13) {
-        const h = hairAt(x, y);
+        const h = hairAt(x - limbs.head[0], y - limbs.head[1]);
         if (h) return h;
       }
+      // Her upper body rises with her shoulders (breathing, hunching),
+      // tapering off down to her waist: yu is where (x, y) falls on her
+      // unmoved figure.
+      const yu = y + limbs.lift * Math.max(0, Math.min(1, (30 - y) / 14));
       // The neck, showing where the hair parts — shadowed just under the head.
-      if (y >= 9 && y < 15 && ax < 1.8) return y < 12.5 ? SKIN_DARK : SKIN;
+      if (yu >= 9 && yu < 15 && ax < 1.8) return yu < 12.5 ? SKIN_DARK : SKIN;
       // Torso: the dress below its diagonal top, bare shoulders and back above it.
-      if (y >= 14 && y < 40 && ax < 12) {
-        let half = y < 22 ? 6 - (y - 14) * 0.12 : 5 + (y - 22) * 0.32;
-        if (y > 26) {
-          half += Math.sin(t * 8 + y * 0.6) * 0.5 * wind;
-          if (hash(Math.floor(y * 0.9), x < 0 ? 1 : 2) > 0.72) half -= 0.9; // nicks torn out of the sides
+      if (yu >= 14 && yu < 40 && ax < 12) {
+        let half = yu < 22 ? 6 - (yu - 14) * 0.12 : 5 + (yu - 22) * 0.32;
+        if (yu > 26) {
+          half += Math.sin(t * 8 + yu * 0.6) * 0.5 * wind;
+          if (hash(Math.floor(yu * 0.9), x < 0 ? 1 : 2) > 0.72) half -= 0.9; // nicks torn out of the sides
         }
-        if (ax <= half && y < hemAt(x, t, wind)) {
-          if (segDist(x, y, -4.4, 14.2, -3.4, dressTop(-3.4)) < 0.85) return DRESS_DARK; // the strap
-          if (y < dressTop(x)) return ax > half - 1 ? SKIN_DARK : SKIN;                // bare shoulders and back
+        if (ax <= half && yu < hemAt(x, t, wind)) {
+          if (segDist(x, yu, -4.4, 14.2, -3.4, dressTop(-3.4)) < 0.85) return DRESS_DARK; // the strap
+          if (yu < dressTop(x)) return ax > half - 1 ? SKIN_DARK : SKIN;                // bare shoulders and back
           // A couple of tears, showing what's behind.
-          if (((x - 2.8) / 1.1) ** 2 + ((y - 29.5) / 0.7) ** 2 <= 1) return 0;
-          if (((x + 4.3) / 0.8) ** 2 + ((y - 32.5) / 1.1) ** 2 <= 1) return 0;
+          if (((x - 2.8) / 1.1) ** 2 + ((yu - 29.5) / 0.7) ** 2 <= 1) return 0;
+          if (((x + 4.3) / 0.8) ** 2 + ((yu - 32.5) / 1.1) ** 2 <= 1) return 0;
           if (ax > half - 1.2) return DRESS_DARK;                    // the sides turn away from you
-          if (y > 24 && (Math.abs(x - 3) < 0.6 || Math.abs(x + 3.5) < 0.6 || Math.abs(x) < 0.5)) return DRESS_DARK; // folds
-          if (y < dressTop(x) + 2 && ax < 3) return DRESS_LIGHT;     // light across the top
+          if (yu > 24 && (Math.abs(x - 3) < 0.6 || Math.abs(x + 3.5) < 0.6 || Math.abs(x) < 0.5)) return DRESS_DARK; // folds
+          if (yu < dressTop(x) + 2 && ax < 3) return DRESS_LIGHT;    // light across the top
           return DRESS;
         }
       }
-      // Arms: bare, out to the sides and a little down, gliding.
-      if (y > -5 && y < 33) for (let i = 0; i < 2; i++) {
+      // Arms: bare, out to the sides and a little down, gliding — the
+      // free (left) one bending a little at the elbow.
+      if (y > -5 && y < 35) for (let i = 0; i < 2; i++) {
         const side = i * 2 - 1;
-        const sx = side * 5.5, sy = 15.5;
+        const sx = side * 5.5, sy = 15.5 - limbs.lift;
         const hx = limbs.hands[i * 2], hy = limbs.hands[i * 2 + 1];
-        const d = segDist(x, y, sx, sy, hx, hy);
-        if (d < 1.4) {
-          const along = (x - sx) / (hx - sx); // 0 at the shoulder, 1 at the hand
-          return y > (sy + (hy - sy) * along) + 0.5 ? SKIN_DARK : SKIN;
-        }
+        const ex = i ? (sx + hx) / 2 : limbs.elbow[0], ey = i ? (sy + hy) / 2 : limbs.elbow[1];
+        const m = limbAt(x, y, sx, sy, ex, ey) || limbAt(x, y, ex, ey, hx, hy);
+        if (m) return m;
         if (Math.hypot(x - hx, y - hy - 0.5) < 1.6) return SKIN;
       }
-      // Legs: trailing below the hem with a slight lazy kick, ending in
-      // bare feet — you see the soles, the boat being ahead of you.
-      if (y > 32 && ax < 7) for (let i = 0; i < 2; i++) {
+      // Legs: trailing below the hem, bending a little at the knee, ending
+      // in bare feet — you see the soles, the boat being ahead of you.
+      if (y > 32 && ax < 13) for (let i = 0; i < 2; i++) {
         const side = i * 2 - 1;
-        const top = side * 2.6, foot = limbs.feet[i];
-        if (segDist(x, y, top, 34, foot, 42.5) < 1.3) return ax < 2.6 ? SKIN_DARK : SKIN;
+        const kx = limbs.knees[i * 2], ky = limbs.knees[i * 2 + 1];
+        const hx = limbs.heels[i * 2], hy = limbs.heels[i * 2 + 1];
+        for (let s = 0; s < 2; s++) {
+          const ax0 = s ? kx : side * 2.6, ay0 = s ? ky : 34, bx = s ? hx : kx, by = s ? hy : ky; // hip to knee, knee to heel
+          if (segNear(x, y, ax0, ay0, bx, by) < 1.3) return (x - ax0 - (bx - ax0) * segK) * side < 0 ? SKIN_DARK : SKIN; // the inner side shadowed
+        }
         // Feet: pointed, the way a flyer's would be — from the heel at the
         // end of the leg, tapering down and a little outward to the toes.
         // Seen from behind, the soles face you.
-        const toeX = foot + side * 1.3, toeY = 46.8;
-        const along = (y - 42.6) / (toeY - 42.6); // 0 at the heel, 1 at the toes
-        if (along >= 0 && along <= 1 && segDist(x, y, foot, 42.6, toeX, toeY) < 1.25 - 0.7 * along) {
-          return along < 0.2 ? SKIN : SOLE;
+        const tx = limbs.toes[i * 2], ty = limbs.toes[i * 2 + 1];
+        if (segNear(x, y, hx, hy + 0.1, tx, ty) < 1.25 - 0.7 * segK && y >= hy) {
+          return segK < 0.2 ? SKIN : SOLE;
         }
       }
       return 0;
@@ -1040,7 +1061,7 @@
     const jump = { start: -Infinity };
 
     function requestJump() {
-      const t = performance.now() / 1000; // the same clock the animation runs on
+      const t = gameClock(); // the same clock the animation runs on
       if (t - jump.start >= JUMP_TIME) jump.start = t;
     }
 
@@ -1144,6 +1165,92 @@
       }
     }
 
+    // Her body's own motion, besides the sword arm. Always a little, on a
+    // par with her floating: slow breathing (her shoulders rising), her
+    // head swaying, her free arm drifting and her legs idly treading,
+    // bending at the knee in turn. More when she moves: as a slash pulls
+    // her about, her free arm and legs trail after her body on a spring
+    // (so they swing a little past and settle) and her free arm flings out
+    // to balance; as she jumps she lifts her arm and tucks her legs up,
+    // then flexes at the knees as she bounces on the air. All in figure
+    // units.
+    const LIMB_SPRING = 16, LIMB_DAMPING = 0.55; // how stiffly the trailing limbs follow, and how quickly they settle
+    const LIMB_LAG_MAX = 4.5;                     // the furthest they trail behind
+    const SLASH_LEAN = 0.012;                     // extra lean per unit a slash pulls her sideways (radians)
+    const trail = { x: 0, y: 0, vx: 0, vy: 0, last: null }; // where her trailing limbs are headed (her body as it was)
+
+    function poseBody(t, pose) {
+      // The spring: `trail` chases her body's slash pull; how far behind
+      // it is moves the free arm and legs.
+      const dt = trail.last === null ? 0 : Math.min(0.05, Math.max(0, t - trail.last));
+      trail.last = t;
+      const w = LIMB_SPRING;
+      trail.vx += (w * w * (pose.bx - trail.x) - 2 * LIMB_DAMPING * w * trail.vx) * dt;
+      trail.vy += (w * w * (pose.by - trail.y) - 2 * LIMB_DAMPING * w * trail.vy) * dt;
+      trail.x += trail.vx * dt;
+      trail.y += trail.vy * dt;
+      const clampLag = (v) => Math.max(-LIMB_LAG_MAX, Math.min(LIMB_LAG_MAX, v));
+      const lagX = clampLag(trail.x - pose.bx), lagY = clampLag(trail.y - pose.by);
+
+      // How hard a slash is pulling her (0 … 1), for the balancing arm.
+      const fling = Math.min(1, Math.hypot(pose.bx, pose.by) / 5);
+      // The jump: `tuck` rises to 1 at the top of the arc and back, and
+      // `armUp` the same but quicker off the mark; `flex` is 1 at the
+      // deepest dip of a bounce, negative as she springs back up.
+      const e = t - jump.start;
+      let tuck = 0, armUp = 0, flex = 0;
+      if (e >= 0 && e < JUMP_TIME) {
+        tuck = Math.sin(Math.PI * e / JUMP_TIME);
+        armUp = tuck ** 0.5;
+      } else if (e >= JUMP_TIME && e < JUMP_TIME + BOUNCE_TIME) {
+        flex = -jumpLift(t) / (BOUNCE_DIP * jumpHeight * FIG_HEIGHT * FIG_SCALE);
+      }
+      const dip = Math.max(0, flex);
+
+      // Breathing, and hunching up as she tucks; her head sways, and ducks
+      // a little into the hunch and the dips.
+      const breath = 0.35 + 0.35 * Math.sin(t * 0.9);
+      limbs.lift = breath + 0.6 * tuck;
+      limbs.head[0] = 0.5 * Math.sin(t * 0.55) + lagX * 0.15;
+      limbs.head[1] = -limbs.lift + 0.7 * tuck + 0.6 * dip;
+
+      // Her free (left) hand: drifting at rest; out and up to balance a
+      // slash, and away from the way it pulls her; up as she jumps; down
+      // as she dips; trailing behind her body.
+      const hx = -12.5 + 0.6 * Math.sin(t * 0.8 + 2) - 2.5 * fling - 0.4 * pose.bx - 1.5 * armUp + 0.9 * lagX;
+      const hy = 26 + Math.sin(t * 1.5 - 1) - 6 * fling - 9 * armUp + 2.5 * dip + 0.9 * lagY;
+      limbs.hands[0] = hx;
+      limbs.hands[1] = hy;
+      // Its elbow: off the straight line from shoulder to hand, up and
+      // outward, bending a little more and less as it drifts.
+      const sx = -5.5, sy = 15.5 - limbs.lift;
+      const ax = hx - sx, ay = hy - sy, al = Math.hypot(ax, ay) || 1;
+      const bend = 1 + 0.4 * Math.sin(t * 1.1) + 0.8 * fling;
+      limbs.elbow[0] = (sx + hx) / 2 - (ay / al) * bend + 0.45 * lagX;
+      limbs.elbow[1] = (sy + hy) / 2 + (ax / al) * bend + 0.45 * lagY;
+      // Her sword hand goes wherever the swing has it.
+      limbs.hands[2] = pose.hx;
+      limbs.hands[3] = pose.hy;
+
+      // Legs: each heel rises some way toward her (`up`), bending the knee
+      // — a little in turn at rest, a lot as she tucks, at the bottom of a
+      // bounce, and as a slash swings her.
+      for (let i = 0; i < 2; i++) {
+        const side = i * 2 - 1;
+        const tread = 0.5 + 0.5 * Math.sin(t * 1.3 + i * Math.PI);
+        const up = 0.7 * tread + 2.6 * tuck + 1.8 * dip + fling * (i ? 0.6 : 1.3);
+        const footX = side * (3.2 - 0.8 * tuck) + Math.sin(t * 2.6 + side * 1.4) * 0.6 // a slight lazy kick, feet together in the tuck
+          + 0.5 * Math.sin(t * 0.7) - 0.25 * pose.bx + lagX;                        // a slow sway, and swinging after a slash
+        const heelY = 42.5 - up + Math.max(-2.5, Math.min(1, lagY));
+        limbs.heels[i * 2] = footX;
+        limbs.heels[i * 2 + 1] = heelY;
+        limbs.knees[i * 2] = (side * 2.6 + footX) / 2 + side * 0.35 * up + 0.4 * lagX;
+        limbs.knees[i * 2 + 1] = 38.3 + 0.15 * up;
+        limbs.toes[i * 2] = footX + side * 1.3;
+        limbs.toes[i * 2 + 1] = heelY + 4.3 * (1 - 0.1 * up);
+      }
+    }
+
     // A grid the figure is drawn into first, so edges can be found by
     // looking at neighbors.
     const FIG_BOX = Math.ceil(28 * FIG_SCALE); // half-size of the area around the pivot that the figure can reach
@@ -1153,27 +1260,24 @@
     function drawFlyer(t) {
       const wind = 0.25 + 0.75 * (speed / THROTTLE_MAX);
       const turn = turnRate / TURN_RATE;                    // -1 (full left) … 1 (full right)
-      const lean = turn * FIG_LEAN;
-      const cos = Math.cos(lean), sin = Math.sin(lean);
       const pose = updateAttack(t);
+      // She leans into turns, and a little after a slash's pull. (Slash
+      // marks only take the turn's lean, so they stay where they were cut.)
+      const turnCos = Math.cos(turn * FIG_LEAN), turnSin = Math.sin(turn * FIG_LEAN);
+      const lean = turn * FIG_LEAN + pose.bx * SLASH_LEAN;
+      const cos = Math.cos(lean), sin = Math.sin(lean);
       // A slash pulls her whole body along after the sword (bx, by).
       const pullX = (pose.bx * cos - pose.by * sin) * FIG_SCALE, pullY = (pose.bx * sin + pose.by * cos) * FIG_SCALE;
       const cx = Math.round(AHEAD_X + turn * 8 * S + pullX);       // drifts a little toward the turn
       const groundY = Math.round(FIG_Y + Math.sin(t * 1.2) * 1.5 * S + pullY);
       const cy = Math.round(groundY - jumpLift(t)); // up in the air, mid-jump
-      for (let i = 0; i < 2; i++) {
-        const side = i * 2 - 1;
-        limbs.hands[i * 2] = side * 12.5;                            // hands out to the sides…
-        limbs.hands[i * 2 + 1] = 26 + Math.sin(t * 1.5 + side) * 1; // …drifting gently up and down
-        limbs.feet[i] = side * 3.2 + Math.sin(t * 2.6 + side * 1.4) * 0.6; // a slight lazy kick
-      }
+      herScreen.x = cx; herScreen.y = cy;
+      poseBody(t, pose);
       poseHair(t, wind);
       // The weapon goes down first, so her hand closes over its grip.
-      limbs.hands[2] = pose.hx; // her right hand holds the weapon, wherever the swing has it
-      limbs.hands[3] = pose.hy;
       drawJumpSwirl(t, cx, groundY);
       drawWindLines(t, cx, cy, turn);
-      drawSlashMarks(t, cx, cy, cos, sin, pose);
+      drawSlashMarks(t, cx, cy, turnCos, turnSin, pose);
       drawSlashTrail(t, cx, cy, cos, sin, pose);
       weapon.draw(pose, cx, cy, cos, sin, t);
       // Fill the grid: for every screen pixel near the figure, rotate it
@@ -1369,6 +1473,7 @@
       from: null,      // the pose it started from
       queued: null,    // a slash clicked for during this one
       recorded: false, // whether this slash's swing has finished (and been noted for alternating)
+      struck: false,   // whether this slash has struck yet (see strikeSquids)
       lastKind: null, lastReverse: false, lastEnd: -Infinity, // for alternating
     };
     let lastPose = null;
@@ -1405,11 +1510,12 @@
       attack.from = lastPose || restPose(t);
       attack.queued = null;
       attack.recorded = false;
+      attack.struck = false;
       slashMarks.push({ kind, reverse: attack.reverse, start: t });
     }
 
     function requestSlash(kind) {
-      const t = performance.now() / 1000; // the same clock the animation runs on
+      const t = gameClock(); // the same clock the animation runs on
       if (attack.kind) attack.queued = kind;
       else startSlash(kind, t);
     }
@@ -1590,13 +1696,44 @@
     const CONTROL_KEYS = [...FASTER, ...SLOWER, ...LEFT, ...RIGHT];
     const anyHeld = (codes) => codes.some((c) => held.has(c));
 
+    // Pause (Esc): everything stops where it is — the game's clock too,
+    // so nothing jumps ahead on resuming — and the screen dims under
+    // "Game Paused". Esc again carries on. Controls are ignored meanwhile.
+    let paused = false, pausedAt = 0, pausedTotal = 0; // pausedTotal: ms spent paused so far
+    function gameClock() { return ((paused ? pausedAt : performance.now()) - pausedTotal) / 1000; }
+    function togglePause() {
+      paused = !paused;
+      if (paused) {
+        pausedAt = performance.now();
+        held.clear();
+        drawPaused();
+      } else {
+        pausedTotal += performance.now() - pausedAt;
+      }
+    }
+    // Over the last frame drawn (which stays on the canvas while paused).
+    function drawPaused() {
+      ctx.fillStyle = "rgba(8, 6, 18, 0.6)";
+      ctx.fillRect(0, 0, W, H);
+      ctx.font = "bold " + 16 * S + "px ui-monospace, Consolas, monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText("Game Paused", (view.left + view.right) / 2, (view.top + view.bottom) / 2);
+      ctx.textAlign = "left"; // back to what the other overlays expect
+    }
+
     addEventListener("keydown", (e) => {
+      if (e.code === "Escape" && !e.repeat) togglePause();
+      if (paused) return;
       if (CONTROL_KEYS.includes(e.code)) {
         held.add(e.code);
         e.preventDefault(); // don't scroll the page
       }
     });
     addEventListener("keydown", (e) => {
+      if (e.code === "Space") e.preventDefault(); // don't scroll the page, paused or not
+      if (paused) return;
       if (e.code === "KeyM" && !e.repeat) showChart = !showChart;
       if (e.code === "KeyF" && !e.repeat) showFrameTime = !showFrameTime;
       if (e.code === "Space") {
@@ -1608,6 +1745,7 @@
     // Mouse: left click slashes horizontally, right click vertically (and
     // doesn't open the browser's menu).
     addEventListener("mousedown", (e) => {
+      if (paused) return;
       if (e.button === 0) requestSlash("horizontal");
       if (e.button === 2) requestSlash("vertical");
     });
@@ -1661,11 +1799,14 @@
     //    The wind blows one way across the map, so which way the clouds
     //    drift depends on your heading.
     // =====================================================================
-    const MAP_SIZE = 4000;              // metres each way (≈ 13 min to cross at 1×, 1½ min at full speed)
-    const SPEED_1X = 5;                 // metres per second at 1× (about 10 knots)
-    const SUN_BEARING = 1.5 * Math.PI;  // the sun sets due west
-    const MOON_BEARING = 0.75 * Math.PI; // the moon hangs southeast
-    const WIND_BEARING = 0;             // the wind blows north (rightward across the view when facing the sun)
+    // The map itself — its size, where the sun, moon and wind lie, where
+    // she starts and its enemies — is defined in js/maps.js.
+    const MAP = MAPS.openSea;
+    const MAP_SIZE = MAP.size;            // metres each way (≈ 13 min to cross at 1×, 1½ min at full speed)
+    const SPEED_1X = 5;                   // metres per second at 1× (about 10 knots)
+    const SUN_BEARING = MAP.sunBearing;
+    const MOON_BEARING = MAP.moonBearing;
+    const WIND_BEARING = MAP.windBearing; // (rightward across the view when facing the sun)
 
     // How wide the view is: pixels of screen per radian of turn (about an
     // 80° field of view across the screen).
@@ -1674,7 +1815,7 @@
 
     // Mid-sea, heading just south of the sunset, so the sun sits right of
     // straight ahead (at SUN_X) as in the earlier scenes.
-    const boat = { x: MAP_SIZE / 2, y: MAP_SIZE / 2, heading: SUN_BEARING - (SUN_X - AHEAD_X) / PX_PER_RAD };
+    const boat = { x: MAP.start.x, y: MAP.start.y, heading: SUN_BEARING - (SUN_X - AHEAD_X) / PX_PER_RAD };
 
     // The unit vector a compass bearing points along.
     const forwardOf = (b) => ({ x: Math.sin(b), y: -Math.cos(b) });
@@ -1742,7 +1883,137 @@
     }
 
     // =====================================================================
-    // 10. Draw it. The sky gradient only changes when you turn (it's
+    // 10. Things on the water: terrain and enemies. What they are and how
+    //    they look is in js/terrain.js and js/enemies.js; where they are on
+    //    the map, in js/maps.js. Here they're placed in the view. For now
+    //    there's no flying into mountains.
+    //
+    //    Each is placed like everything else in the view: its distance
+    //    ahead decides which depth of sea it sits at (so it rises out of the
+    //    horizon small and grows as you near it, in step with the waves),
+    //    and its bearing decides how far across the screen it is (so it
+    //    swings with the sun when you turn). It's drawn in among the wave
+    //    rows, so nearer crests hide its lower part. Only the map's squares
+    //    near the boat are looked at.
+    //
+    //    Squids swim: each wanders slowly round its spot, and when she's
+    //    near, lashes at her. Her slashes strike whatever's in their path
+    //    at about her distance: a squid struck by the slash it's weak to is
+    //    cut apart and falls away into the sea (and stays gone); any other
+    //    slash only makes it flinch.
+    // =====================================================================
+    const SEE_AHEAD = SPEED_1X * TRIP_SECONDS; // how far the view reaches (m): the horizon is one row trip away
+    const FADE_IN = 10;                        // metres over which a thing dithers in as it comes over the horizon
+    const screenTarget = { buf, w: W, h: H };  // the pixel target things draw into
+
+    // Every thing a map scatters by squares (`cell` metres across) within
+    // sight, as { found, key, dx, dy }: what found(i, j) gave for the
+    // square, a number naming the square, and where it is from the boat
+    // (without wrapping, since the squares count from the boat's own).
+    function nearby(cell, found) {
+      const out = [], N = MAP_SIZE / cell;
+      const reach = Math.ceil(SEE_AHEAD / cell) + 1;
+      const ci = Math.floor(boat.x / cell), cj = Math.floor(boat.y / cell);
+      for (let i = ci - reach; i <= ci + reach; i++) {
+        for (let j = cj - reach; j <= cj + reach; j++) {
+          const wi = ((i % N) + N) % N, wj = ((j % N) + N) % N; // the square, wrapped onto the map
+          const f = found(wi, wj);
+          if (f) out.push({ found: f, key: wi * N + wj, dx: (i + f.fx) * cell - boat.x, dy: (j + f.fy) * cell - boat.y });
+        }
+      }
+      return out;
+    }
+
+    // Where she is: as far ahead of the boat as the sea at her pivot's
+    // depth, worked out from rowLook.
+    const HER_AHEAD = (() => {
+      let lo = 0, hi = MAX_DEPTH;
+      for (let n = 0; n < 40; n++) { const mid = (lo + hi) / 2; if (rowLook(mid).base < FIG_Y) lo = mid; else hi = mid; }
+      return SEE_AHEAD * (1 - (lo / MAX_DEPTH) ** (1 / EASE));
+    })();
+    const WANDER = 2;                    // metres a squid wanders from its spot
+    const LASH_NEAR = 5, LASH_FAR = 13;  // metres from her: lashing hard within the first, starting at the second
+    const DEATH_TIME = 1.5;              // seconds a cut squid takes to fall away
+    const FLINCH_TIME = 0.4;             // seconds a flinch lasts
+    // What's happened to squids, by square (see nearby): { cut, reverse, at }
+    // once cut, { flinchAt } after a flinch.
+    const squidFates = new Map();
+    let squidsInView = [];               // this frame's, for slashes to find (see strikeSquids)
+
+    // The things in view, each with its depth and how to draw it, sorted
+    // far to near — for drawSea to paint in among the wave rows. `t` is
+    // the game's clock, for the squids' movement.
+    function thingsInView(t) {
+      const inView = [];
+      squidsInView = [];
+      const f = forwardOf(boat.heading), right = { x: -f.y, y: f.x };
+      // `def` is the thing's TERRAIN or ENEMIES entry; `sink` how far
+      // (in size units) its bottom dips below the troughs at its depth;
+      // `look` how a squid is posed (see ENEMIES). Returns where it is.
+      const place = ({ found, dx, dy }, def, sink, look) => {
+        const ahead = dx * f.x + dy * f.y;
+        if (ahead <= 1 || ahead >= SEE_AHEAD) return null;
+        const side = dx * right.x + dy * right.y;
+        const x = AHEAD_X + Math.atan2(side, ahead) * PX_PER_RAD;
+        if (Math.abs(x - AHEAD_X) > W) return null; // well off to the side
+        const depth = (1 - ahead / SEE_AHEAD) ** EASE * MAX_DEPTH; // the depth of sea at that distance
+        const row = rowLook(depth);
+        const unitPx = row.scale * (def.sizes[0] + (def.sizes[1] - def.sizes[0]) * found.size);
+        const haze = (1 - Math.min(1, depth)) ** 2;
+        const fadeIn = Math.min(1, (SEE_AHEAD - ahead) / FADE_IN);
+        inView.push({ depth, draw: () => def.draw(screenTarget, x, row.base + sink * unitPx, unitPx, haze, fadeIn, look) });
+        return { ahead, side, x, unitPx };
+      };
+      if (MAP.terrain) for (const thing of nearby(MAP.terrain.cell, (i, j) => terrainInCell(MAP, i, j))) place(thing, TERRAIN[thing.found.kind], 0.05);
+      for (const e of nearby(MAP.enemies.cell, (i, j) => enemyInCell(MAP, i, j))) {
+        const fate = squidFates.get(e.key) || {};
+        const age = fate.cut ? (t - fate.at) / DEATH_TIME : 0;
+        if (age >= 1) continue; // fallen away
+        // Wandering slowly round its spot, each in its own time.
+        const seed = hash(e.key, 17), drift = 0.08 + 0.06 * hash(e.key, 19);
+        e.dx += WANDER * Math.sin(t * drift + seed * 40);
+        e.dy += WANDER * Math.cos(t * drift * 0.8 + seed * 90);
+        const look = { form: e.found.form, colorway: e.found.colorway, seed, t, aimX: herScreen.x, aimY: herScreen.y };
+        if (fate.cut) look.cut = { by: fate.cut, reverse: fate.reverse, age };
+        if (fate.flinchAt !== undefined) look.flinch = Math.max(0, 1 - (t - fate.flinchAt) / FLINCH_TIME);
+        const def = ENEMIES[e.found.kind];
+        const at = place(e, def, def.sink, look);
+        if (!at) continue;
+        // Lashing at her, the nearer the harder.
+        const near = Math.hypot(at.ahead - HER_AHEAD, at.side);
+        look.lash = Math.max(0, Math.min(1, (LASH_FAR - near) / (LASH_FAR - LASH_NEAR)));
+        if (!fate.cut) squidsInView.push({ key: e.key, def, form: pickBy(def.forms, e.found.form), ...at });
+      }
+      return inView.sort((a, b) => a.depth - b.depth);
+    }
+
+    // A slash strikes once, partway into its swing: every squid in its
+    // path at about her distance (from a little nearer than her to a few
+    // metres beyond, where its mark is cut) is cut apart if it's weak to
+    // that slash, or flinches if not. The path is where the slash's mark
+    // runs on screen: right across in front of her for a horizontal one,
+    // a narrow band down her right side for a vertical one.
+    const STRIKE_AT = SLASH_WINDUP + SLASH_SWING * 0.35; // seconds into a slash
+    const STRIKE_NEARER = 3, STRIKE_BEYOND = 9;          // metres either side of her distance
+    function strikeSquids(t) {
+      if (!attack.kind || attack.struck || t - attack.start < STRIKE_AT) return;
+      attack.struck = true;
+      const across = attack.kind === "horizontal";
+      for (const sq of squidsInView) {
+        const da = sq.ahead - HER_AHEAD;
+        if (da < -STRIKE_NEARER || da > STRIKE_BEYOND) continue;
+        const halfW = sq.form.shape.w * sq.def.unit * sq.unitPx / 2; // its half-width on screen, at rest
+        const hit = across
+          ? Math.abs(sq.x - herScreen.x) <= 48 * FIG_SCALE + 0.5 * halfW
+          : Math.abs(sq.x - (herScreen.x + 10 * FIG_SCALE)) <= 8 * FIG_SCALE + 0.6 * halfW;
+        if (!hit) continue;
+        if (sq.def.cutBy === attack.kind) squidFates.set(sq.key, { cut: attack.kind, reverse: attack.reverse, at: t });
+        else squidFates.set(sq.key, { flinchAt: t });
+      }
+    }
+
+    // =====================================================================
+    // 11. Draw it. The sky gradient only changes when you turn (it's
     //    darker facing away from the sun), so it's saved and only redrawn
     //    when that changes; every frame copies it back and stacks the
     //    moving parts on top — stars, the sun and moon (which turning
@@ -1791,8 +2062,9 @@
     let travel = 0, last = null;
     function frame(ms) {
       requestAnimationFrame(frame);
+      if (paused) return; // the paused frame stays on screen as it is
       const started = performance.now();
-      const t = ms / 1000;
+      const t = (ms - pausedTotal) / 1000; // the game's clock, which stops while paused
       const dt = last === null ? 0 : Math.min(t - last, 0.1); // capped, so a hidden tab doesn't lurch forward
       last = t;
       updateThrottle(t, dt);
@@ -1819,7 +2091,8 @@
       for (const c of clouds) drawCloud(c);
       drawGulls(t); // after the stars, so a star can never twinkle on top of a gull
       const seaStart = performance.now();
-      drawSea(travel, swing);
+      strikeSquids(t);
+      drawSea(travel, swing, thingsInView(t));
       const flyerStart = performance.now();
       drawFlyer(t);
       seaMs = smooth(seaMs, flyerStart - seaStart);

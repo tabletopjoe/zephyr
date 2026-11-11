@@ -39,11 +39,16 @@
   <nav aria-label="Pages"></nav>
   <iframe title="Page"></iframe>
   <script>
-    // Tab 1 is the game itself; the tabs after it will be the game's menus,
-    // modes and options. To add one: put its page in pages/ and add a line
-    // here. Tabs are numbered in this order.
+    // Tab 1 is the game itself. Tabs 2 and 3 are development modules —
+    // indexes for looking at enemies and maps in isolation while tweaking
+    // them. Menus, modes and options will follow. To add one: put its page
+    // in pages/ and add a line here. Tabs are numbered in this order, and
+    // the number keys switch to them (1–9; each page passes its number
+    // keys up here — see js/tabkeys.js).
     const PAGES = [
-      { file: "pages/game.html", title: "Play (↑/W faster, ↓/S slower, ←/→ or A/D turn, M chart, F frame time, click / right-click to slash, Space to jump)" },
+      { file: "pages/game.html", title: "Play (↑/W faster, ↓/S slower, ←/→ or A/D turn, M chart, F frame time, click / right-click to slash, Space to jump, Esc to pause)" },
+      { file: "pages/enemies.html", title: "Enemy index" },
+      { file: "pages/maps.html", title: "Map index" },
     ];
 
     const nav = document.querySelector("nav");
@@ -53,7 +58,7 @@
       const b = document.createElement("button");
       b.type = "button";
       b.textContent = i + 1;
-      b.title = page.title;
+      b.title = page.title + " — key " + (i + 1);
       b.addEventListener("click", () => { location.hash = i + 1; });
       nav.appendChild(b);
       return b;
@@ -69,6 +74,15 @@
       buttons.forEach((b, j) => b.setAttribute("aria-current", String(j === i)));
     }
     addEventListener("hashchange", show);
+
+    // Number keys: from a page (passed up by js/tabkeys.js), or pressed
+    // while the shell itself has the keyboard.
+    const goTo = (n) => { if (n >= 1 && n <= PAGES.length) location.hash = n; };
+    addEventListener("message", (e) => { if (e.data && typeof e.data.zephyrTab === "number") goTo(e.data.zephyrTab); });
+    addEventListener("keydown", (e) => {
+      const m = /^Digit([1-9])$/.exec(e.code);
+      if (m && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey) goTo(Number(m[1]));
+    });
     show();
 
     // Hand keyboard focus to the page, so the game hears its keys without

@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>zephyr · map index</title>
+  <link rel="stylesheet" href="../css/dev.css" />
+</head>
+<body>
+  <nav class="list" aria-label="Maps"></nav>
+  <nav class="list assets" aria-label="What's on the map" hidden></nav>
+  <main>
+    <h1 id="name"></h1>
+    <p class="sub" id="sub"></p>
+    <div id="mapView">
+      <canvas class="preview" id="preview" style="max-width: 600px"></canvas>
+      <p class="hover" id="hover">Point at the map for what's there.</p>
+    </div>
+    <canvas class="preview" id="stage" hidden></canvas>
+    <table class="details" id="details"></table>
+  </main>
+  <!-- The same map and enemy definitions the game uses. -->
+  <script src="../js/pixels.js"></script>
+  <script src="../js/tabkeys.js"></script>
+  <script src="../js/enemies.js"></script>
+  <script src="../js/terrain.js"></script>
+  <script src="../js/maps.js"></script>
+  <script src="../js/preview.js"></script>
+  <script>
+    // =====================================================================
+    // Map index: pick a map from the list to see all of it from above —
+    // its terrain and every enemy where they lie, where she starts, and
+    // where the sun, moon and wind are round the edge (read like a clock:
+    // north at twelve) — with its details. Point at the map to see what's
+    // at that spot. Picking a map also lists what's on it in a second
+    // column: pick one of those to see it on its own, large, across its
+    // size range and as it looks at a few distances in the game. A place
+    // to look at maps and their terrain in isolation while tweaking them
+    // (in js/maps.js and js/terrain.js); editing tools may come later.
+    // =====================================================================
+    const SIZE = 600, PAD = 50;          // the canvas, and the margin round the map for the clock marks
+    const MAP_PX = SIZE - 2 * PAD;       // the map itself, in pixels
+    const canvas = document.getElementById("preview");
+    canvas.width = SIZE;
+    canvas.height = SIZE;
+    const ctx = canvas.getContext("2d");
+
+    // Enemy marks: each kind's own shape, so tall lancers and wide
+    // sprawlers can be told apart at a glance.
+    const MARKS = { lancer: [1, 4], sprawler: [4, 1] }; // [width, height] in pixels
+    const MARK_COLOR = { lancer: "#e3826a", sprawler: "#ffb36b" };
+    // Terrain marks: a tall spike for a karst tower, a low wedge for an
+    // islet — triangles [half-width, height] in pixels.
+    const TERRAIN_MARKS = { karst: [4, 13], islet: [6, 7] };
+    const TERRAIN_COLOR = { karst: "#a6e09a", islet: "#e8e2fa" };
+
+    const degrees = (b) => Math.round(b * 180 / Math.PI);
+    const clock = (b) => {
+      const h = (b / (2 * Math.PI)) * 12;
+      const hh = Math.floor(h) || 12, mm = Math.round((h - Math.floor(h)) * 60);
+      return hh + ":" + String(mm).padStart(2, "0");
+    };
+    const compass = (b) => ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"][Math.round(b / (Math.PI / 4)) % 8];
+
+    let current = null, currentId = null; // the map being shown
+
+    // Everything on a map: its terrain (each found once, from its squares)
+    // and how many enemies of each kind.
+    function survey(map) {
+      const terrain = [], enemies = {};
+      if (map.terrain) {
+        const N = map.size / map.terrain.cell;
+        for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) { const t = terrainInCell(map, i, j); if (t) terrain.push(t); }
+      }
+      const N = map.size / map.enemies.cell;
+      for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) { const e = enemyInCell(map, i, j); if (e) enemies[e.kind] = (enemies[e.kind] || 0) + 1; }
+      return { terrain, enemies };
+    }
+
+    // The whole map from above.
+    function show(id) {
+      const map = MAPS[id];
+      current = map;
+      currentId = id;
+      showView("map");
+      listAssets(id);
+      const k = MAP_PX / map.size; // pixels per metre
+      ctx.clearRect(0, 0, SIZE, SIZE);
+
+      // The sea, with a grid line every 500 m.
+      ctx.fillStyle = "#1a2552";
+      ctx.fillRect(PAD, PAD, MAP_PX, MAP_PX);
+      ctx.strokeStyle = "rgba(157, 147, 196, 0.15)";
+      ctx.lineWidth = 1;
+      for (let m = 500; m < map.size; m += 500) {
+        const p = PAD + Math.round(m * k) + 0.5;
+        ctx.beginPath(); ctx.moveTo(p, PAD); ctx.lineTo(p, PAD + MAP_PX); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(PAD, p); ctx.lineTo(PAD + MAP_PX, p); ctx.stroke();
+      }
+      ctx.strokeStyle = map.wraps ? "#7a3b73" : "#ffc27a"; // a wrapping edge is drawn softer: it's not a wall
+      ctx.setLineDash(map.wraps ? [6, 4] : []);
+      ctx.strokeRect(PAD - 0.5, PAD - 0.5, MAP_PX + 1, MAP_PX + 1);
+      ctx.setLineDash([]);
+
+      // Every enemy.
+      const e = map.enemies, N = map.size / e.cell;
+      const counts = surveys[id].enemies;
+      for (let i = 0; i < N; i++) {
+        for (let j = 0; j < N; j++) {
+          const found = enemyInCell(map, i, j);
+          if (!found) continue;
+          const [mw, mh] = MARKS[found.kind] || [2, 2];
+          ctx.fillStyle = MARK_COLOR[found.kind] || "#ffffff";
+          ctx.fillRect(Math.round(PAD + (i + found.fx) * e.cell * k - mw / 2), Math.round(PAD + (j + found.fy) * e.cell * k - mh / 2), mw, mh);
+        }
+      }
+
+      // The terrain, over the enemies.
+      for (const t of surveys[id].terrain) {
+        const [hw, th] = TERRAIN_MARKS[t.kind] || [3, 3];
+        const tx = Math.round(PAD + t.x * k) + 0.5, ty = Math.round(PAD + t.y * k) + 0.5;
+        ctx.fillStyle = TERRAIN_COLOR[t.kind] || "#ffffff";
+        ctx.strokeStyle = "#0e0c1a";
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(tx - hw - 0.5, ty + 2); ctx.lineTo(tx, ty + 2 - th); ctx.lineTo(tx + hw + 0.5, ty + 2); ctx.closePath();
+        ctx.fill(); ctx.stroke();
+      }
+
+      // Where she starts.
+      const sx = PAD + map.start.x * k, sy = PAD + map.start.y * k;
+      ctx.strokeStyle = "#fff6d8";
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(sx, sy, 7, 0, 2 * Math.PI); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(sx - 11, sy); ctx.lineTo(sx + 11, sy); ctx.moveTo(sx, sy - 11); ctx.lineTo(sx, sy + 11); ctx.stroke();
+
+      // Round the edge: north, then the sun, moon and wind at their bearings.
+      const center = SIZE / 2, ring = MAP_PX / 2 + 26;
+      const at = (b, r = ring) => [center + Math.sin(b) * r, center - Math.cos(b) * r];
+      ctx.font = "13px ui-monospace, Consolas, monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "#9d93c4";
+      ctx.fillText("N", ...at(0));
+      // Sun: a half-set disc.
+      const [ux, uy] = at(map.sunBearing);
+      ctx.fillStyle = "#fff1b5";
+      ctx.beginPath(); ctx.arc(ux, uy, 10, Math.PI, 2 * Math.PI); ctx.fill();
+      // Moon: a crescent.
+      const [mx, my] = at(map.moonBearing);
+      ctx.fillStyle = "#f6efd6";
+      ctx.beginPath(); ctx.arc(mx, my, 10, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = "#1b1838"; // the panel behind, cutting the crescent
+      ctx.beginPath(); ctx.arc(mx - 4, my - 2, 9, 0, 2 * Math.PI); ctx.fill();
+      // Wind: an arrow pointing the way it blows.
+      const [wx, wy] = at(map.windBearing + 0.35);
+      ctx.save();
+      ctx.translate(wx, wy);
+      ctx.rotate(map.windBearing);
+      ctx.strokeStyle = "#b8afd8";
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(0, 9); ctx.lineTo(0, -9); ctx.moveTo(-5, -4); ctx.lineTo(0, -9); ctx.lineTo(5, -4); ctx.stroke();
+      ctx.restore();
+
+      // Details.
+      document.getElementById("name").textContent = map.name;
+      document.getElementById("sub").textContent = map.description;
+      const total = Object.values(counts).reduce((a, b) => a + b, 0);
+      const tCounts = {};
+      for (const t of surveys[id].terrain) tCounts[t.kind] = (tCounts[t.kind] || 0) + 1;
+      const terrainList = map.terrain ? Object.keys(map.terrain.kinds).map((kind) =>
+        `<span class="swatch"><i style="background:${TERRAIN_COLOR[kind] || "#fff"}"></i>${TERRAIN[kind] ? TERRAIN[kind].name : kind}: ${tCounts[kind] || 0}</span>`).join("") : "";
+      const kindList = e.kinds.map((kind) =>
+        `<span class="swatch"><i style="background:${MARK_COLOR[kind] || "#fff"}"></i>${ENEMIES[kind] ? ENEMIES[kind].name : kind}: ${counts[kind] || 0}</span>`).join("");
+      const rows = [
+        ["Size", map.size + " m × " + map.size + " m"],
+        ["Edges", map.wraps ? "wrap round to the opposite side (dashed)" : "solid"],
+        ["Start", map.start.x + " m east, " + map.start.y + " m south (the cross)"],
+        ["Sun", "sets " + compass(map.sunBearing) + " — " + degrees(map.sunBearing) + "°, " + clock(map.sunBearing)],
+        ["Moon", compass(map.moonBearing) + " — " + degrees(map.moonBearing) + "°, " + clock(map.moonBearing)],
+        ["Wind", "blows " + compass(map.windBearing) + " — " + degrees(map.windBearing) + "°"],
+        ...(map.terrain ? [
+          ["Terrain", surveys[id].terrain.length + " in all: up to one per " + map.terrain.cell + " m square, " + Math.round(map.terrain.chance * 100) +
+            "% of squares, none within " + map.terrain.clearStart + " m of the start"],
+          ["By kind", `<div class="swatches">${terrainList}</div>`],
+        ] : []),
+        ["Enemies", total + " in all: up to one per " + e.cell + " m square, " + Math.round(e.chance * 100) + "% of squares" +
+          (map.terrain ? ", none within " + map.terrain.clearance + " m of terrain" : "")],
+        ["By kind", `<div class="swatches">${kindList}</div>`],
+        ["Defined in", "js/maps.js — MAPS." + id],
+      ];
+      document.getElementById("details").innerHTML = rows.map(([a, b]) => `<tr><th>${a}</th><td>${b}</td></tr>`).join("");
+
+      buttons.forEach((b) => b.setAttribute("aria-current", String(b.dataset.id === id)));
+      try { localStorage.setItem("zephyr.mapIndex", id); localStorage.removeItem("zephyr.mapIndex.asset"); } catch (err) { /* storage unavailable: just don't remember */ }
+    }
+
+    // One piece of terrain on its own: large, with her height beside it
+    // for scale; across its size range; and as it looks in the game at a
+    // few distances, hazed toward the horizon.
+    const stage = makeStage(document.getElementById("stage")); // see js/preview.js
+    function showTerrain(kind) {
+      const map = current, t = TERRAIN[kind], sprite = t.sprite;
+      showView("terrain");
+      const tw = (sprite.w / sprite.perUnit) * t.unit, th = (sprite.h / sprite.perUnit) * t.unit; // its usual size, in size units
+      stage.clear();
+
+      const big = Math.min(300, 330 / th, 380 / tw);
+      t.draw(stage.target, 80 + (tw * big) / 2, WATERLINE + 6, big, 0, 1);
+      stage.herHeight(40, big);
+
+      const mid = Math.min(110, 170 / (th * t.sizes[1]), 130 / (tw * t.sizes[1]));
+      [[t.sizes[0], "smallest"], [1, "usual"], [t.sizes[1], "largest"]].forEach(([k, name], i) => {
+        const x = 600 + i * 140;
+        t.draw(stage.target, x, 200, mid * k, 0, 1);
+        stage.label(name + " ×" + k, x, 212);
+      });
+      stage.label("size range", 740, 240);
+
+      let cursor = 520;
+      [0.15, 0.06, 0.02, 0.005].forEach((depth) => {
+        const unitPx = scaleAt(depth), x = cursor + (tw * unitPx) / 2;
+        t.draw(stage.target, x, WATERLINE + 6, unitPx, hazeAt(depth), 1);
+        stage.label(Math.round(aheadAt(depth)) + " m", x, WATERLINE + 16);
+        cursor += tw * unitPx + 20;
+      });
+      stage.label("in the game, by distance", (520 + cursor) / 2, STAGE_H - 28);
+      stage.show();
+
+      document.getElementById("name").textContent = t.name;
+      document.getElementById("sub").textContent = t.family + " · on " + map.name;
+      const count = surveys[currentId].terrain.filter((f) => f.kind === kind).length;
+      const swatches = t.colors.map((c, i) => `<span class="swatch"><i style="background:${c}"></i>${t.materials[i]} ${c}</span>`).join("");
+      const rows = [
+        ["Description", t.description],
+        ["Kind", t.family],
+        ["Usual size", tw.toFixed(2) + " wide × " + th.toFixed(2) + " tall (size units; she's " + HER_HEIGHT + " tall)"],
+        ["Size range", "×" + t.sizes[0] + " to ×" + t.sizes[1]],
+        ["On " + map.name, count + " (" + Math.round(map.terrain.kinds[kind] * 100) + "% of terrain); squids keep " + map.terrain.clearance + " m clear"],
+        ["Obstacle", "yes — she'll have to fly round it (not yet: for now it's only drawn)"],
+        ["Sprite", sprite.w + " × " + sprite.h + " px, worked out once from its shape and scaled to fit"],
+        ["Colors", `<div class="swatches">${swatches}</div>`],
+        ["Defined in", "js/terrain.js — TERRAIN." + kind + "; placed by js/maps.js — MAPS." + currentId + ".terrain"],
+      ];
+      document.getElementById("details").innerHTML = rows.map(([a, b]) => `<tr><th>${a}</th><td>${b}</td></tr>`).join("");
+
+      assetButtons.forEach((b) => b.setAttribute("aria-current", String(b.dataset.id === kind)));
+      try { localStorage.setItem("zephyr.mapIndex.asset", kind); } catch (err) { /* ignore */ }
+    }
+
+    // The map from above, or one thing on it.
+    function showView(which) {
+      document.getElementById("mapView").hidden = which !== "map";
+      document.getElementById("stage").hidden = which !== "terrain";
+      if (which === "map") assetButtons.forEach((b) => b.setAttribute("aria-current", "false"));
+    }
+
+    // The second column: what's on the chosen map, with how many of each.
+    // Pick one to see it; pick it again (or the map) to go back to the map.
+    const assetNav = document.querySelector(".assets");
+    let assetButtons = [];
+    function listAssets(id) {
+      const map = MAPS[id];
+      assetNav.innerHTML = "";
+      assetButtons = [];
+      if (!map.terrain) { assetNav.hidden = true; return; }
+      const heading = document.createElement("h2");
+      heading.textContent = "Terrain";
+      assetNav.appendChild(heading);
+      for (const kind of Object.keys(map.terrain.kinds)) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.dataset.id = kind;
+        b.innerHTML = `${TERRAIN[kind].name}<span class="count">${surveys[id].terrain.filter((f) => f.kind === kind).length}</span>`;
+        b.addEventListener("click", () => (b.getAttribute("aria-current") === "true" ? show(id) : showTerrain(kind)));
+        assetNav.appendChild(b);
+        assetButtons.push(b);
+      }
+      assetNav.hidden = false;
+    }
+
+    // Pointing at the map: the spot's position, and the enemy in that
+    // square if there is one.
+    const hover = document.getElementById("hover");
+    canvas.addEventListener("mousemove", (ev) => {
+      const map = current;
+      const r = canvas.getBoundingClientRect();
+      const px = (ev.clientX - r.left) * (SIZE / r.width) - PAD, py = (ev.clientY - r.top) * (SIZE / r.height) - PAD;
+      if (px < 0 || py < 0 || px >= MAP_PX || py >= MAP_PX) { hover.textContent = "Point at the map for what's there."; return; }
+      const mx = px * map.size / MAP_PX, my = py * map.size / MAP_PX;
+      const cell = map.enemies.cell, i = Math.floor(mx / cell), j = Math.floor(my / cell);
+      const found = enemyInCell(map, i, j);
+      let text = Math.round(mx) + " m east, " + Math.round(my) + " m south";
+      const t = terrainNear(map, mx, my, 40);
+      if (t) {
+        const kind = TERRAIN[t.kind];
+        text += " — " + kind.name + " ×" + (kind.sizes[0] + (kind.sizes[1] - kind.sizes[0]) * t.size).toFixed(2) + " at " + Math.round(t.x) + ", " + Math.round(t.y);
+      }
+      if (found) {
+        const enemy = ENEMIES[found.kind];
+        const size = enemy ? enemy.sizes[0] + (enemy.sizes[1] - enemy.sizes[0]) * found.size : 1;
+        const name = enemy ? pickBy(enemy.colorways, found.colorway).name + " " + enemy.name +
+          (enemy.forms.length > 1 ? " (" + pickBy(enemy.forms, found.form).name.toLowerCase() + ")" : "") : found.kind;
+        text += " — " + name + " ×" + size.toFixed(2) + " at " +
+          Math.round((i + found.fx) * cell) + ", " + Math.round((j + found.fy) * cell);
+      }
+      hover.textContent = text;
+    });
+    canvas.addEventListener("mouseleave", () => { hover.textContent = "Point at the map for what's there."; });
+
+    // The list.
+    const nav = document.querySelector(".list");
+    const heading = document.createElement("h2");
+    heading.textContent = "Maps";
+    nav.appendChild(heading);
+    const buttons = Object.keys(MAPS).map((id) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = MAPS[id].name;
+      b.dataset.id = id;
+      b.addEventListener("click", () => show(id));
+      nav.appendChild(b);
+      return b;
+    });
+
+    const surveys = {};
+    for (const id in MAPS) surveys[id] = survey(MAPS[id]);
+
+    let first = Object.keys(MAPS)[0], asset = null;
+    try {
+      const saved = localStorage.getItem("zephyr.mapIndex"), savedAsset = localStorage.getItem("zephyr.mapIndex.asset");
+      if (saved in MAPS) { first = saved; if (MAPS[saved].terrain && savedAsset in MAPS[saved].terrain.kinds) asset = savedAsset; }
+    } catch (err) { /* ignore */ }
+    show(first);
+    if (asset) showTerrain(asset);
+  </script>
+</body>
+</html>

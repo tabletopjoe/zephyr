@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>zephyr · enemy index</title>
+  <link rel="stylesheet" href="../css/dev.css" />
+</head>
+<body>
+  <nav class="list" aria-label="Enemies"></nav>
+  <main>
+    <h1 id="name"></h1>
+    <p class="sub" id="sub"></p>
+    <div class="choices" id="forms"></div>
+    <div class="choices" id="colorways"></div>
+    <div class="choices" id="try"></div>
+    <canvas class="preview" id="preview"></canvas>
+    <table class="details" id="details"></table>
+  </main>
+  <!-- The same enemy definitions the game uses. -->
+  <script src="../js/pixels.js"></script>
+  <script src="../js/tabkeys.js"></script>
+  <script src="../js/enemies.js"></script>
+  <script src="../js/preview.js"></script>
+  <script>
+    // =====================================================================
+    // Enemy index: pick an enemy from the list to see it on its own —
+    // large, across its size range, and as it looks at a few distances in
+    // the game — with its details. A place to look at enemies in
+    // isolation while tweaking them (in js/enemies.js); editing tools may
+    // come later. They move as in the game, and the Try buttons set them
+    // lashing (at her height marker), flinching, or cut apart.
+    // =====================================================================
+    const stage = makeStage(document.getElementById("preview")); // see js/preview.js
+    const target = stage.target;
+
+    // Which form and colorway to show (indexes), kept while switching
+    // between enemies where they exist.
+    const pick = { form: 0, colorway: 0 };
+
+    // A row of buttons to choose one of `list` (by name) into pick[key].
+    function choices(el, label, list, key, id) {
+      el.hidden = list.length < 2;
+      el.innerHTML = `<span>${label}</span>`;
+      list.forEach((item, i) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = item.name;
+        b.setAttribute("aria-current", String(i === pick[key]));
+        if (item.colors) b.style.setProperty("--chip", item.colors[1]);
+        b.addEventListener("click", () => { pick[key] = i; show(id); });
+        el.appendChild(b);
+      });
+    }
+
+    // What's being tried: lashing (on or off), and when the last flinch
+    // and cut started (seconds on the page's clock).
+    const trying = { lash: false, flinchAt: -Infinity, cutAt: -Infinity, reverse: false };
+    const CUT_SECONDS = 1.5, CUT_HOLD = 0.8; // as long as in the game, then a pause before it's back
+    let current = null;
+
+    function tryButtons() {
+      const el = document.getElementById("try");
+      el.innerHTML = "<span>Try</span>";
+      const add = (name, pressed, act) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = name;
+        if (pressed !== null) b.setAttribute("aria-current", String(pressed));
+        b.addEventListener("click", () => { act(performance.now() / 1000); tryButtons(); });
+        el.appendChild(b);
+      };
+      add("Lash", trying.lash, () => { trying.lash = !trying.lash; });
+      add("Flinch", null, (t) => { trying.flinchAt = t; });
+      add("Cut apart", null, (t) => { trying.cutAt = t; trying.reverse = !trying.reverse; });
+    }
+
+    function show(id) {
+      const enemy = ENEMIES[id];
+      current = id;
+      pick.form = Math.min(pick.form, enemy.forms.length - 1);
+      pick.colorway = Math.min(pick.colorway, enemy.colorways.length - 1);
+      const form = enemy.forms[pick.form], colorway = enemy.colorways[pick.colorway];
+      choices(document.getElementById("forms"), "Form", enemy.forms, "form", id);
+      choices(document.getElementById("colorways"), "Colorway", enemy.colorways, "colorway", id);
+      tryButtons();
+
+      // Details.
+      document.getElementById("name").textContent = enemy.name;
+      document.getElementById("sub").textContent = enemy.family + " · weak to a " + enemy.weakness;
+      const hw = (n) => (n * enemy.unit).toFixed(2);
+      const shape = form.shape;
+      const swatches = colorway.colors.map((c, i) =>
+        `<span class="swatch"><i style="background:${c}"></i>${enemy.materials[i]} ${c}</span>`).join("");
+      const rows = [
+        ["Description", enemy.description],
+        ["Family", enemy.family],
+        ["Weak to", enemy.weakness + " (cuts it apart; other slashes make it flinch)"],
+        ["Usual size", hw(shape.w) + " wide × " + hw(shape.h) + " tall, at rest (size units; she's " + HER_HEIGHT + " tall)"],
+        ["Size range", "×" + enemy.sizes[0] + " to ×" + enemy.sizes[1]],
+        ["Forms", enemy.forms.map((f) => f.name).join(", ") + " — equally likely"],
+        ["Colorways", enemy.colorways.map((c) => c.name).join(", ") + " — equally likely"],
+        ["Drawing", "worked out afresh every frame from its shape (so its arms can move), at up to " + RASTER_MAX + " px per size unit"],
+        [colorway.name + " colors", `<div class="swatches">${swatches}</div>`],
+        ["Defined in", "js/enemies.js — ENEMIES." + id],
+      ];
+      document.getElementById("details").innerHTML = rows.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join("");
+
+      buttons.forEach((b) => b.setAttribute("aria-current", String(b.dataset.id === id)));
+      try { localStorage.setItem("zephyr.enemyIndex", id); } catch (e) { /* storage unavailable: just don't remember */ }
+    }
+
+    // Every frame: the chosen enemy, moving, large, across its size range,
+    // and as it looks at a few distances in the game.
+    function render(ms) {
+      requestAnimationFrame(render);
+      const t = ms / 1000, enemy = ENEMIES[current];
+      const big = 300, herTop = WATERLINE - HER_HEIGHT * big;
+      const look = {
+        form: (pick.form + 0.5) / enemy.forms.length, colorway: (pick.colorway + 0.5) / enemy.colorways.length,
+        t, seed: 0.3, lash: trying.lash ? 1 : 0, aimX: 40, aimY: (herTop + WATERLINE) / 2,
+        flinch: Math.max(0, 1 - (t - trying.flinchAt) / 0.4),
+      };
+      const cutAge = (t - trying.cutAt) / CUT_SECONDS;
+      if (cutAge < 1) look.cut = { by: enemy.cutBy, reverse: trying.reverse, age: cutAge };
+      const hidden = cutAge >= 1 && cutAge < 1 + CUT_HOLD / CUT_SECONDS; // fallen away, for a moment
+      stage.clear();
+
+      // Large, with her height beside it for scale.
+      if (!hidden) enemy.draw(target, 270, WATERLINE + 6, big, 0, 1, look);
+      stage.herHeight(40, big);
+
+      // Its size range: smallest, usual, largest.
+      const mid = 110;
+      [[enemy.sizes[0], "smallest"], [1, "usual"], [enemy.sizes[1], "largest"]].forEach(([k, name], i) => {
+        const x = 610 + i * 120;
+        if (!hidden) enemy.draw(target, x, 250, mid * k, 0, 1, { ...look, seed: 0.5 + i * 0.1, lash: 0 });
+        stage.label(name + " ×" + k, x, 262);
+      });
+
+      // As it looks in the game at a few distances (her own distance
+      // first), hazed toward the horizon.
+      [0.69, 0.35, 0.15, 0.04].forEach((depth, i) => {
+        const x = 610 + i * 100;
+        if (!hidden) enemy.draw(target, x, WATERLINE + 6, scaleAt(depth), hazeAt(depth), 1, { ...look, seed: 0.8 + i * 0.1, lash: 0 });
+        stage.label(Math.round(aheadAt(depth)) + " m", x, WATERLINE + 16);
+      });
+
+      stage.label("in the game, by distance", 760, STAGE_H - 28);
+      stage.label("size range", 730, 300);
+      stage.show();
+    }
+
+    // The list, grouped by family.
+    const nav = document.querySelector(".list");
+    const buttons = [];
+    const families = {};
+    for (const id in ENEMIES) (families[ENEMIES[id].family] ||= []).push(id);
+    for (const family in families) {
+      const h = document.createElement("h2");
+      h.textContent = family + (family.endsWith("s") ? "" : "s");
+      nav.appendChild(h);
+      for (const id of families[family]) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = ENEMIES[id].name;
+        b.dataset.id = id;
+        b.addEventListener("click", () => show(id));
+        nav.appendChild(b);
+        buttons.push(b);
+      }
+    }
+
+    let first = Object.keys(ENEMIES)[0];
+    try { const saved = localStorage.getItem("zephyr.enemyIndex"); if (saved in ENEMIES) first = saved; } catch (e) { /* ignore */ }
+    show(first);
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>
